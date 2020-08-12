@@ -38,16 +38,24 @@ var (
 	// new segment.
 	ErrSegmentReplaced = errors.New("segment was replaced")
 
+	// ErrCommitLogDeleted is returned when attempting to read from a commit
+	// log that has been deleted.
+	ErrCommitLogDeleted = errors.New("commit log was deleted")
+
+	// ErrCommitLogClosed is returned when attempting to read from a commit
+	// log that has been closed.
+	ErrCommitLogClosed = errors.New("commit log was closed")
+
 	// timestamp returns the current time in Unix nanoseconds. This function
 	// exists for mocking purposes.
 	timestamp = func() int64 { return time.Now().UnixNano() }
 )
 
-type Segment struct {
+type segment struct {
 	writer         io.Writer
 	reader         io.Reader
 	log            *os.File
-	Index          *Index
+	Index          *index
 	BaseOffset     int64
 	firstOffset    int64
 	lastOffset     int64
@@ -57,7 +65,7 @@ type Segment struct {
 	maxBytes       int64
 	path           string
 	suffix         string
-	waiters        map[contextReader]chan struct{}
+	waiters        map[interface{}]chan struct{}
 	sealed         bool
 	closed         bool
 	replaced       bool
@@ -65,15 +73,15 @@ type Segment struct {
 	sync.RWMutex
 }
 
-func NewSegment(path string, baseOffset, maxBytes int64, isNew bool, suffix string) (*Segment, error) {
-	s := &Segment{
+func newSegment(path string, baseOffset, maxBytes int64, isNew bool, suffix string) (*segment, error) {
+	s := &segment{
 		maxBytes:    maxBytes,
 		BaseOffset:  baseOffset,
 		firstOffset: -1,
 		lastOffset:  -1,
 		path:        path,
 		suffix:      suffix,
-		waiters:     make(map[contextReader]chan struct{}),
+		waiters:     make(map[interface{}]chan struct{}),
 	}
 	// If this is a new segment, ensure the file doesn't already exist.
 	if isNew && exists(s.logPath()) {
@@ -95,13 +103,13 @@ func NewSegment(path string, baseOffset, maxBytes int64, isNew bool, suffix stri
 	return s, err
 }
 
-// setupIndex creates and initializes an Index.
+// setupIndex creates and initializes an index.
 // Initialization is:
-// - Initialize Index position
+// - Initialize index position
 // - Initialize firstOffset/lastOffset
 // - Initialize firstWriteTime/lastWriteTime
-func (s *Segment) setupIndex() (err error) {
-	s.Index, err = NewIndex(options{
+func (s *segment) setupIndex() (err error) {
+	s.Index, err = newIndex(options{
 		path:       s.indexPath(),
 		baseOffset: s.BaseOffset,
 	})
@@ -117,7 +125,7 @@ func (s *Segment) setupIndex() (err error) {
 		s.lastOffset = lastEntry.Offset
 		s.lastWriteTime = lastEntry.Timestamp
 		// Read the first entry to get firstOffset and firstWriteTime.
-		var firstEntry Entry
+		var firstEntry entry
 		if err := s.Index.ReadEntryAtFileOffset(&firstEntry, 0); err != nil {
 			return err
 		}
@@ -130,7 +138,7 @@ func (s *Segment) setupIndex() (err error) {
 // CheckSplit determines if a new log segment should be rolled out either
 // because this segment is full or LogRollTime has passed since the first
 // message was written to the segment.
-func (s *Segment) CheckSplit(logRollTime time.Duration) bool {
+func (s *segment) CheckSplit(logRollTime time.Duration) bool {
 	s.RLock()
 	defer s.RUnlock()
 	if s.position >= s.maxBytes {
@@ -148,7 +156,7 @@ func (s *Segment) CheckSplit(logRollTime time.Duration) bool {
 // Seal a segment from being written to. This is called on the former active
 // segment after a new segment is rolled. This is a no-op if the segment is
 // already sealed.
-func (s *Segment) Seal() {
+func (s *segment) Seal() {
 	s.Lock()
 	defer s.Unlock()
 	if s.sealed {
@@ -157,10 +165,10 @@ func (s *Segment) Seal() {
 	s.sealed = true
 	// Notify any readers waiting for data.
 	s.notifyWaiters()
-	s.Index.Shrink()
+	s.Index.Shrink() // nolint: errcheck
 }
 
-func (s *Segment) NextOffset() int64 {
+func (s *segment) NextOffset() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	// If the segment hasn't been written to, the next offset should be the
@@ -171,37 +179,37 @@ func (s *Segment) NextOffset() int64 {
 	return s.lastOffset + 1
 }
 
-func (s *Segment) FirstOffset() int64 {
+func (s *segment) FirstOffset() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.firstOffset
 }
 
-func (s *Segment) LastOffset() int64 {
+func (s *segment) LastOffset() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.lastOffset
 }
 
-func (s *Segment) Position() int64 {
+func (s *segment) Position() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.position
 }
 
-func (s *Segment) IsEmpty() bool {
+func (s *segment) IsEmpty() bool {
 	s.RLock()
 	defer s.RUnlock()
 	return s.firstOffset == -1
 }
 
-func (s *Segment) MessageCount() int64 {
+func (s *segment) MessageCount() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.Index.CountEntries()
 }
 
-func (s *Segment) WriteMessageSet(ms []byte, entries []*Entry) error {
+func (s *segment) WriteMessageSet(ms []byte, entries []*entry) error {
 	s.Lock()
 	defer s.Unlock()
 	if _, err := s.write(ms, entries); err != nil {
@@ -212,7 +220,7 @@ func (s *Segment) WriteMessageSet(ms []byte, entries []*Entry) error {
 
 // write a byte slice to the log at the current position. This increments the
 // offset as well as sets the position to the new tail.
-func (s *Segment) write(p []byte, entries []*Entry) (n int, err error) {
+func (s *segment) write(p []byte, entries []*entry) (n int, err error) {
 	if s.closed {
 		return 0, ErrSegmentClosed
 	}
@@ -233,7 +241,7 @@ func (s *Segment) write(p []byte, entries []*Entry) (n int, err error) {
 	return n, nil
 }
 
-func (s *Segment) ReadAt(p []byte, off int64) (n int, err error) {
+func (s *segment) ReadAt(p []byte, off int64) (n int, err error) {
 	s.RLock()
 	defer s.RUnlock()
 	if s.closed {
@@ -245,41 +253,61 @@ func (s *Segment) ReadAt(p []byte, off int64) (n int, err error) {
 	return s.log.ReadAt(p, off)
 }
 
-func (s *Segment) notifyWaiters() {
+func (s *segment) notifyWaiters() {
 	for r, ch := range s.waiters {
 		close(ch)
 		delete(s.waiters, r)
 	}
 }
 
-func (s *Segment) waitForData(r contextReader, pos int64) <-chan struct{} {
-	wait := make(chan struct{})
+func (s *segment) WaitForLEO(waiter interface{}, leo int64) <-chan struct{} {
 	s.Lock()
+	defer s.Unlock()
+	if s.lastOffset != leo {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return s.waitForData(waiter, s.position)
+}
+func (s *segment) WaitForData(waiter interface{}, pos int64) <-chan struct{} {
+	s.Lock()
+	ch := s.waitForData(waiter, pos)
+	s.Unlock()
+	return ch
+}
+
+func (s *segment) waitForData(waiter interface{}, pos int64) <-chan struct{} {
+	// Check if we're already registered.
+	wait, ok := s.waiters[waiter]
+	if ok {
+		return wait
+	}
+	wait = make(chan struct{})
 	// Check if data has been written and/or the segment was filled.
 	if s.position > pos || s.position >= s.maxBytes {
 		close(wait)
 	} else {
-		s.waiters[r] = wait
+		s.waiters[waiter] = wait
 	}
-	s.Unlock()
 	return wait
 }
 
-func (s *Segment) removeWaiter(r contextReader) {
+func (s *segment) removeWaiter(waiter interface{}) {
 	s.Lock()
-	delete(s.waiters, r)
+	delete(s.waiters, waiter)
 	s.Unlock()
 }
 
 // Close a segment such that it can no longer be read from or written to. This
 // operation is idempotent.
-func (s *Segment) Close() error {
+func (s *segment) Close() error {
 	s.Lock()
 	defer s.Unlock()
 	return s.close()
 }
 
-func (s *Segment) close() error {
+func (s *segment) close() error {
 	if s.closed {
 		return nil
 	}
@@ -294,17 +322,17 @@ func (s *Segment) close() error {
 }
 
 // Cleaned creates a cleaned segment for this segment.
-func (s *Segment) Cleaned() (*Segment, error) {
-	return NewSegment(s.path, s.BaseOffset, s.maxBytes, false, cleanedSuffix)
+func (s *segment) Cleaned() (*segment, error) {
+	return newSegment(s.path, s.BaseOffset, s.maxBytes, false, cleanedSuffix)
 }
 
 // Truncated creates a truncated segment for this segment.
-func (s *Segment) Truncated() (*Segment, error) {
-	return NewSegment(s.path, s.BaseOffset, s.maxBytes, false, truncatedSuffix)
+func (s *segment) Truncated() (*segment, error) {
+	return newSegment(s.path, s.BaseOffset, s.maxBytes, false, truncatedSuffix)
 }
 
 // Replace replaces the given segment with the callee.
-func (s *Segment) Replace(old *Segment) error {
+func (s *segment) Replace(old *segment) error {
 	s.Lock()
 	defer s.Unlock()
 	old.Lock()
@@ -336,10 +364,10 @@ func (s *Segment) Replace(old *Segment) error {
 
 // findEntry returns the first entry whose offset is greater than or equal to
 // the given offset.
-func (s *Segment) findEntry(offset int64) (e *Entry, err error) {
+func (s *segment) findEntry(offset int64) (e *entry, err error) {
 	s.RLock()
 	defer s.RUnlock()
-	e = &Entry{}
+	e = &entry{}
 	n := int(s.Index.Position() / entryWidth)
 	idx := sort.Search(n, func(i int) bool {
 		if err := s.Index.ReadEntryAtFileOffset(e, int64(i*entryWidth)); err != nil {
@@ -356,10 +384,10 @@ func (s *Segment) findEntry(offset int64) (e *Entry, err error) {
 
 // findEntryByTimestamp returns the first entry whose timestamp is greater than
 // or equal to the given offset.
-func (s *Segment) findEntryByTimestamp(timestamp int64) (e *Entry, err error) {
+func (s *segment) findEntryByTimestamp(timestamp int64) (e *entry, err error) {
 	s.RLock()
 	defer s.RUnlock()
-	e = &Entry{}
+	e = &entry{}
 	n := int(s.Index.Position() / entryWidth)
 	idx := sort.Search(n, func(i int) bool {
 		if err := s.Index.ReadEntryAtFileOffset(e, int64(i*entryWidth)); err != nil {
@@ -375,7 +403,7 @@ func (s *Segment) findEntryByTimestamp(timestamp int64) (e *Entry, err error) {
 }
 
 // Delete closes the segment and then deletes its log and index files.
-func (s *Segment) Delete() error {
+func (s *segment) Delete() error {
 	if err := s.Close(); err != nil {
 		return err
 	}
@@ -394,23 +422,23 @@ func (s *Segment) Delete() error {
 	return nil
 }
 
-type SegmentScanner struct {
-	s  *Segment
-	is *IndexScanner
+type segmentScanner struct {
+	s  *segment
+	is *indexScanner
 }
 
-func NewSegmentScanner(segment *Segment) *SegmentScanner {
-	return &SegmentScanner{s: segment, is: NewIndexScanner(segment.Index)}
+func newSegmentScanner(segment *segment) *segmentScanner {
+	return &segmentScanner{s: segment, is: newIndexScanner(segment.Index)}
 }
 
 // Scan should be called repeatedly to iterate over the messages in the
 // segment, it will return io.EOF when there are no more messages.
-func (s *SegmentScanner) Scan() (MessageSet, *Entry, error) {
+func (s *segmentScanner) Scan() (messageSet, *entry, error) {
 	entry, err := s.is.Scan()
 	if err != nil {
 		return nil, nil, err
 	}
-	header := make(MessageSet, msgSetHeaderLen)
+	header := make(messageSet, msgSetHeaderLen)
 	_, err = s.s.ReadAt(header, entry.Position)
 	if err != nil {
 		return nil, nil, err
@@ -424,10 +452,10 @@ func (s *SegmentScanner) Scan() (MessageSet, *Entry, error) {
 	return msgSet, entry, nil
 }
 
-func (s *Segment) logPath() string {
+func (s *segment) logPath() string {
 	return filepath.Join(s.path, fmt.Sprintf(fileFormat, s.BaseOffset, logSuffix+s.suffix))
 }
 
-func (s *Segment) indexPath() string {
+func (s *segment) indexPath() string {
 	return filepath.Join(s.path, fmt.Sprintf(fileFormat, s.BaseOffset, indexSuffix+s.suffix))
 }

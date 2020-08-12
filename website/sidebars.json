@@ -1,0 +1,31 @@
+{
+  "docs": {
+    "Overview": [
+        "overview",
+        "faq",
+        "concepts",
+        "quick-start",
+        "feature-comparison",
+        "roadmap"
+    ],
+    "Configuration": [
+        "configuration",
+        "ha-and-consistency-configuration"
+    ],
+    "Deployment": [
+        "deployment"
+    ],
+    "Developing With Liftbridge": [
+        "activity",
+        "pausing-streams"
+    ],
+    "Technical Deep Dive": [
+        "replication-protocol",
+        "envelope-protocol"
+    ],
+    "Client Libraries": [
+        "clients",
+        "client-implementation"
+    ]
+  }
+}

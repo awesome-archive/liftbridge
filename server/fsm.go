@@ -5,24 +5,22 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"strconv"
 
 	"github.com/dustin/go-humanize/english"
 	"github.com/hashicorp/raft"
 	"github.com/pkg/errors"
 
-	"github.com/liftbridge-io/liftbridge/server/proto"
+	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
 
 // recoverLatestCommittedFSMLog returns the last committed Raft FSM log entry.
 // It returns nil if there are no entries in the Raft log.
 func (s *Server) recoverLatestCommittedFSMLog(applyIndex uint64) (*raft.Log, error) {
-	raftNode := s.getRaft()
-	commitIndex, err := strconv.ParseUint(raftNode.Stats()["commit_index"], 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	firstIndex, err := raftNode.store.FirstIndex()
+	var (
+		raftNode        = s.getRaft()
+		commitIndex     = raftNode.getCommitIndex()
+		firstIndex, err = raftNode.store.FirstIndex()
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +110,7 @@ func (s *Server) Apply(l *raft.Log) interface{} {
 		}
 		panic(err)
 	}
+	s.activity.SignalCommit()
 	return value
 }
 
@@ -124,46 +123,67 @@ func (s *Server) Apply(l *raft.Log) interface{} {
 func (s *Server) apply(log *proto.RaftLog, index uint64, recovered bool) (interface{}, error) {
 	switch log.Op {
 	case proto.Op_CREATE_STREAM:
-		stream := log.CreateStreamOp.Stream
-		// Make sure to set the leader epoch on the stream.
-		stream.LeaderEpoch = index
-		stream.Epoch = index
-		err := s.applyCreateStream(stream, recovered)
-		// If err is ErrStreamExists, we want to return this value back to the
-		// caller.
-		if err == ErrStreamExists {
-			return err, nil
+		// Make sure to set the leader epoch on the partitions.
+		for _, partition := range log.CreateStreamOp.Stream.Partitions {
+			partition.LeaderEpoch = index
+			partition.Epoch = index
 		}
-		if err != nil {
+		if err := s.applyCreateStream(log.CreateStreamOp.Stream, recovered); err != nil {
 			return nil, err
 		}
 	case proto.Op_SHRINK_ISR:
 		var (
-			subject = log.ShrinkISROp.Subject
-			name    = log.ShrinkISROp.Name
-			replica = log.ShrinkISROp.ReplicaToRemove
+			stream    = log.ShrinkISROp.Stream
+			replica   = log.ShrinkISROp.ReplicaToRemove
+			partition = log.ShrinkISROp.Partition
 		)
-		if err := s.applyShrinkISR(subject, name, replica, index); err != nil {
+		if err := s.applyShrinkISR(stream, replica, partition, index); err != nil {
 			return nil, err
 		}
 	case proto.Op_CHANGE_LEADER:
 		var (
-			subject = log.ChangeLeaderOp.Subject
-			name    = log.ChangeLeaderOp.Name
-			leader  = log.ChangeLeaderOp.Leader
+			stream    = log.ChangeLeaderOp.Stream
+			leader    = log.ChangeLeaderOp.Leader
+			partition = log.ChangeLeaderOp.Partition
 		)
-		if err := s.applyChangeStreamLeader(subject, name, leader, index); err != nil {
+		if err := s.applyChangePartitionLeader(stream, leader, partition, index); err != nil {
 			return nil, err
 		}
 	case proto.Op_EXPAND_ISR:
 		var (
-			subject = log.ExpandISROp.Subject
-			name    = log.ExpandISROp.Name
-			replica = log.ExpandISROp.ReplicaToAdd
+			stream    = log.ExpandISROp.Stream
+			replica   = log.ExpandISROp.ReplicaToAdd
+			partition = log.ExpandISROp.Partition
 		)
-		if err := s.applyExpandISR(subject, name, replica, index); err != nil {
+		if err := s.applyExpandISR(stream, replica, partition, index); err != nil {
 			return nil, err
 		}
+	case proto.Op_DELETE_STREAM:
+		var (
+			stream = log.DeleteStreamOp.Stream
+		)
+		if err := s.applyDeleteStream(stream); err != nil {
+			return nil, err
+		}
+	case proto.Op_PAUSE_STREAM:
+		var (
+			stream     = log.PauseStreamOp.Stream
+			partitions = log.PauseStreamOp.Partitions
+			resumeAll  = log.PauseStreamOp.ResumeAll
+		)
+		if err := s.applyPauseStream(stream, partitions, resumeAll); err != nil {
+			return nil, err
+		}
+	case proto.Op_RESUME_STREAM:
+		var (
+			stream     = log.ResumeStreamOp.Stream
+			partitions = log.ResumeStreamOp.Partitions
+		)
+		if err := s.applyResumeStream(stream, partitions, recovered); err != nil {
+			return nil, err
+		}
+	case proto.Op_PUBLISH_ACTIVITY:
+		s.activity.SetLastPublishedRaftIndex(log.PublishActivityOp.RaftIndex)
 	default:
 		return nil, fmt.Errorf("Unknown Raft operation: %s", log.Op)
 	}
@@ -183,24 +203,27 @@ func (s *Server) startedRecovery() {
 }
 
 // finishedRecovery should be called when the FSM has finished replaying any
-// unapplied log entries. This will start any streams recovered during the
-// replay.
+// unapplied log entries. This will start any stream partitions recovered
+// during the replay. It returns the number of streams which had partitions
+// that were recovered.
 func (s *Server) finishedRecovery() (int, error) {
 	// If LogRecovery is disabled, we need to restore the previous log output.
 	if !s.config.LogRecovery {
 		s.logger.SetWriter(s.loggerOut)
 	}
-	count := 0
+	recoveredStreams := make(map[string]struct{})
 	for _, stream := range s.metadata.GetStreams() {
-		recovered, err := stream.StartRecovered()
-		if err != nil {
-			return 0, err
-		}
-		if recovered {
-			count++
+		for _, partition := range stream.GetPartitions() {
+			recovered, err := partition.StartRecovered()
+			if err != nil {
+				return 0, err
+			}
+			if recovered {
+				recoveredStreams[stream.GetName()] = struct{}{}
+			}
 		}
 	}
-	return count, nil
+	return len(recoveredStreams), nil
 }
 
 // fsmSnapshot is returned by an FSM in response to a Snapshot. It must be safe
@@ -251,13 +274,27 @@ func (f *fsmSnapshot) Release() {}
 // happening.
 func (s *Server) Snapshot() (raft.FSMSnapshot, error) {
 	var (
-		streams = s.metadata.GetStreams()
-		protos  = make([]*proto.Stream, len(streams))
+		streams      = s.metadata.GetStreams()
+		protoStreams = make([]*proto.Stream, len(streams))
 	)
 	for i, stream := range streams {
-		protos[i] = stream.Stream
+		var (
+			partitions  = stream.GetPartitions()
+			protoStream = &proto.Stream{
+				Name:       stream.GetName(),
+				Subject:    stream.GetSubject(),
+				Config:     stream.GetConfig(),
+				Partitions: make([]*proto.Partition, len(partitions)),
+			}
+		)
+		for j, partition := range partitions {
+			// Set paused flag on protobuf since it's only held in memory.
+			partition.Paused = partition.IsPaused()
+			protoStream.Partitions[j] = partition.Partition
+		}
+		protoStreams[i] = protoStream
 	}
-	return &fsmSnapshot{&proto.MetadataSnapshot{Streams: protos}}, nil
+	return &fsmSnapshot{&proto.MetadataSnapshot{Streams: protoStreams}}, nil
 }
 
 // Restore is used to restore an FSM from a snapshot. It is not called
@@ -287,32 +324,28 @@ func (s *Server) Restore(snapshot io.ReadCloser) error {
 	if err := s.metadata.Reset(); err != nil {
 		return err
 	}
-	count := 0
 	for _, stream := range snap.Streams {
 		if err := s.applyCreateStream(stream, false); err != nil {
 			return err
 		}
-		count++
 	}
 	s.logger.Debugf("fsm: Finished restoring Raft state from snapshot, recovered %s",
-		english.Plural(count, "stream", ""))
+		english.Plural(len(snap.Streams), "stream", ""))
 	return nil
 }
 
-// applyCreateStream adds the given stream to the metadata store. If the stream
-// is being recovered, it will not be started until after the recovery process
-// completes. If it is not being recovered, the stream will be started as a
-// leader or follower if applicable. ErrStreamExists is returned if the stream
-// already exists.
+// applyCreateStream adds the given stream and its partitions to the metadata
+// store. If the stream is being recovered, its partitions will not be started
+// until after the recovery process completes. If it is not being recovered,
+// the partitions will be started as a leader or follower if applicable. An
+// error is returned if the stream or any of its partitions already exist.
 func (s *Server) applyCreateStream(protoStream *proto.Stream, recovered bool) error {
 	// QUESTION: If this broker is not a replica for the stream, can we just
 	// store a "lightweight" representation of the stream (i.e. the protobuf)
 	// for recovery purposes? There is no need to initialize a commit log for
 	// it.
+
 	stream, err := s.metadata.AddStream(protoStream, recovered)
-	if err == ErrStreamExists {
-		return err
-	}
 	if err != nil {
 		return errors.Wrap(err, "failed to add stream to metadata store")
 	}
@@ -320,76 +353,123 @@ func (s *Server) applyCreateStream(protoStream *proto.Stream, recovered bool) er
 	return nil
 }
 
-// applyShrinkISR removes the given replica from the stream and updates the
-// stream epoch. If the stream epoch is greater than or equal to the specified
-// epoch, this does nothing.
-func (s *Server) applyShrinkISR(subject, name, replica string, epoch uint64) error {
-	stream := s.metadata.GetStream(subject, name)
-	if stream == nil {
-		return fmt.Errorf("No such stream [subject=%s, name=%s]", subject, name)
+// applyShrinkISR removes the given replica from the partition and updates the
+// partition epoch. If the partition epoch is greater than or equal to the
+// specified epoch, this does nothing.
+func (s *Server) applyShrinkISR(stream, replica string, partitionID int32, epoch uint64) error {
+	partition := s.metadata.GetPartition(stream, partitionID)
+	if partition == nil {
+		return fmt.Errorf("No such partition [stream=%s, partition=%d]", stream, partitionID)
 	}
 
 	// Idempotency check.
-	if stream.GetEpoch() >= epoch {
+	if partition.GetEpoch() >= epoch {
 		return nil
 	}
 
-	if err := stream.RemoveFromISR(replica); err != nil {
-		return errors.Wrap(err, fmt.Sprintf("failed to remove %s from ISR for stream %s",
-			replica, stream))
+	if err := partition.RemoveFromISR(replica); err != nil {
+		return errors.Wrap(err, fmt.Sprintf("failed to remove %s from ISR for partition %s",
+			replica, partition))
 	}
 
-	stream.SetEpoch(epoch)
+	partition.SetEpoch(epoch)
 
-	s.logger.Warnf("fsm: Removed replica %s from ISR for stream %s", replica, stream)
+	s.logger.Warnf("fsm: Removed replica %s from ISR for partition %s", replica, partition)
 	return nil
 }
 
-// applyExpandISR adds the given replica to the stream and updates the stream
-// epoch. If the stream epoch is greater than or equal to the specified epoch,
-// this does nothing.
-func (s *Server) applyExpandISR(subject, name, replica string, epoch uint64) error {
-	stream := s.metadata.GetStream(subject, name)
-	if stream == nil {
-		return fmt.Errorf("No such stream [subject=%s, name=%s]", subject, name)
+// applyExpandISR adds the given replica to the partition and updates the
+// partition epoch. If the partition epoch is greater than or equal to the
+// specified epoch, this does nothing.
+func (s *Server) applyExpandISR(stream, replica string, partitionID int32, epoch uint64) error {
+	partition := s.metadata.GetPartition(stream, partitionID)
+	if partition == nil {
+		return fmt.Errorf("No such partition [stream=%s, partition=%d]", stream, partitionID)
 	}
 
 	// Idempotency check.
-	if stream.GetEpoch() >= epoch {
+	if partition.GetEpoch() >= epoch {
 		return nil
 	}
 
-	if err := stream.AddToISR(replica); err != nil {
-		return errors.Wrap(err, fmt.Sprintf("failed to add %s to ISR for stream %s",
-			replica, stream))
+	if err := partition.AddToISR(replica); err != nil {
+		return errors.Wrap(err, fmt.Sprintf("failed to add %s to ISR for partition %s",
+			replica, partition))
 	}
 
-	stream.SetEpoch(epoch)
+	partition.SetEpoch(epoch)
 
-	s.logger.Infof("fsm: Added replica %s to ISR for stream %s", replica, stream)
+	s.logger.Infof("fsm: Added replica %s to ISR for partition %s", replica, partition)
 	return nil
 }
 
-// applyChangeStreamLeader sets the stream's leader to the given replica and
-// updates the stream epoch. If the stream epoch is greater than or equal to
-// the specified epoch, this does nothing.
-func (s *Server) applyChangeStreamLeader(subject, name string, leader string, epoch uint64) error {
-	stream := s.metadata.GetStream(subject, name)
-	if stream == nil {
-		return fmt.Errorf("No such stream [subject=%s, name=%s]", subject, name)
+// applyChangePartitionLeader sets the partition's leader to the given replica
+// and updates the partition epoch. If the partition epoch is greater than or
+// equal to the specified epoch, this does nothing.
+func (s *Server) applyChangePartitionLeader(stream, leader string, partitionID int32, epoch uint64) error {
+	partition := s.metadata.GetPartition(stream, partitionID)
+	if partition == nil {
+		return fmt.Errorf("No such partition [stream=%s, partition=%d]", stream, partitionID)
 	}
 
 	// Idempotency check.
-	if stream.GetEpoch() >= epoch {
+	if partition.GetEpoch() >= epoch {
 		return nil
 	}
 
-	if err := stream.SetLeader(leader, epoch); err != nil {
-		return errors.Wrap(err, "failed to change stream leader")
+	if err := partition.SetLeader(leader, epoch); err != nil {
+		return errors.Wrap(err, "failed to change partition leader")
 	}
 
-	stream.SetEpoch(epoch)
+	partition.SetEpoch(epoch)
 
-	s.logger.Debugf("fsm: Changed leader for stream %s to %s", stream, leader)
+	s.logger.Debugf("fsm: Changed leader for partition %s to %s", partition, leader)
+	return nil
+}
+
+// applyDeleteStream deletes the given stream partition.
+func (s *Server) applyDeleteStream(streamName string) error {
+	stream := s.metadata.GetStream(streamName)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+
+	err := s.metadata.CloseAndDeleteStream(stream)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete stream")
+	}
+
+	s.logger.Debugf("fsm: Deleted stream %s", streamName)
+	return nil
+}
+
+// applyPauseStream pauses the given stream partitions.
+func (s *Server) applyPauseStream(streamName string, partitions []int32, resumeAll bool) error {
+	stream := s.metadata.GetStream(streamName)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+
+	err := stream.Pause(partitions, resumeAll)
+	if err != nil {
+		return errors.Wrap(err, "failed to pause stream")
+	}
+
+	s.logger.Debugf("fsm: Paused stream %s", streamName)
+	return nil
+}
+
+// applyResumeStream unpauses the given stream partitions in the metadata
+// store.  If the partitions are being recovered, they will not be started
+// until after the recovery process completes. If they are not being recovered,
+// the partitions will be started as a leader or follower if applicable.
+func (s *Server) applyResumeStream(streamName string, partitionIDs []int32, recovered bool) error {
+	for _, id := range partitionIDs {
+		partition, err := s.metadata.ResumePartition(streamName, id, recovered)
+		if err != nil {
+			return errors.Wrap(err, "failed to resume partition in metadata store")
+		}
+		s.logger.Debugf("fsm: Resumed partition %s", partition)
+	}
 	return nil
 }

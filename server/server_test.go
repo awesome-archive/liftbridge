@@ -1,20 +1,24 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	lift "github.com/liftbridge-io/go-liftbridge"
-	"github.com/liftbridge-io/go-liftbridge/liftbridge-grpc"
 	natsdTest "github.com/nats-io/nats-server/v2/test"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
+
+	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
 
 var storagePath string
@@ -40,7 +44,7 @@ func getTestConfig(id string, bootstrap bool, port int) *Config {
 	config.Clustering.RaftBootstrapSeed = bootstrap
 	config.DataDir = filepath.Join(storagePath, id)
 	config.Clustering.RaftSnapshots = 1
-	config.Clustering.RaftLogging = true
+	config.LogRaft = true
 	config.Clustering.ServerID = id
 	config.LogLevel = uint32(log.DebugLevel)
 	config.NATS.Servers = []string{"nats://localhost:4222"}
@@ -80,6 +84,17 @@ func getMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Server) 
 	if leader == nil {
 		stackFatalf(t, "No metadata leader found")
 	}
+
+	// Wait for cluster to agree on leader.
+LOOP:
+	for time.Now().Before(deadline) {
+		for _, s := range servers {
+			if string(s.getRaft().Leader()) != leader.config.Clustering.ServerID {
+				continue LOOP
+			}
+		}
+		break
+	}
 	return leader
 }
 
@@ -101,7 +116,27 @@ func waitForNoMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Se
 	stackFatalf(t, "Metadata leader found")
 }
 
-func getStreamLeader(t *testing.T, timeout time.Duration, subject, name string, servers ...*Server) *Server {
+func checkPartitionPaused(t *testing.T, timeout time.Duration, stream string,
+	partitionID int32, paused bool, server *Server) {
+
+	partition := server.metadata.GetPartition(stream, partitionID)
+	if partition == nil {
+		stackFatalf(t, "Partition not found")
+	}
+	var (
+		deadline = time.Now().Add(timeout)
+		isPaused bool
+	)
+	for time.Now().Before(deadline) {
+		isPaused = partition.IsPaused()
+		if isPaused == paused {
+			return
+		}
+	}
+	stackFatalf(t, "Expected partition paused %v, got %v", paused, isPaused)
+}
+
+func getPartitionLeader(t *testing.T, timeout time.Duration, name string, partitionID int32, servers ...*Server) *Server {
 	var (
 		leader   *Server
 		deadline = time.Now().Add(timeout)
@@ -111,11 +146,11 @@ func getStreamLeader(t *testing.T, timeout time.Duration, subject, name string, 
 			if !s.IsRunning() {
 				continue
 			}
-			stream := s.metadata.GetStream(subject, name)
-			if stream == nil {
+			partition := s.metadata.GetPartition(name, partitionID)
+			if partition == nil {
 				continue
 			}
-			streamLeader, _ := stream.GetLeader()
+			streamLeader, _ := partition.GetLeader()
 			if streamLeader == s.config.Clustering.ServerID {
 				if leader != nil {
 					stackFatalf(t, "Found more than one stream leader")
@@ -135,11 +170,11 @@ func getStreamLeader(t *testing.T, timeout time.Duration, subject, name string, 
 }
 
 func forceLogClean(t *testing.T, subject, name string, s *Server) {
-	stream := s.metadata.GetStream(subject, name)
-	if stream == nil {
+	partition := s.metadata.GetPartition(name, 0)
+	if partition == nil {
 		stackFatalf(t, "Stream not found")
 	}
-	if err := stream.log.Clean(); err != nil {
+	if err := partition.log.Clean(); err != nil {
 		stackFatalf(t, "Log clean failed: %s", err)
 	}
 }
@@ -254,6 +289,34 @@ func TestDurableServerID(t *testing.T) {
 	newID := future.Configuration().Servers[0].ID
 	if newID != "a" {
 		t.Fatalf("Incorrect cluster server id, expected: a, got: %s", newID)
+	}
+}
+
+// Ensure server starts the gRPC health service correctly.
+func TestHealthServerStartedCorrectly(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure the first server as a seed.
+	s1Config := getTestConfig("a", true, 20000)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server which should automatically join the first.
+	s2Config := getTestConfig("b", false, 20001)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	conn, err := grpc.Dial("127.0.0.1:20000", []grpc.DialOption{grpc.WithInsecure()}...)
+	require.NoError(t, err)
+	healthClient := grpc_health_v1.NewHealthClient(conn)
+	healthCheckReply, err := healthClient.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{Service: "proto.API"})
+	require.NoError(t, err)
+	if healthCheckReply.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		t.Fatalf("API service is not healthy when it should be: %v", err)
 	}
 }
 
@@ -479,8 +542,9 @@ func TestSubscribeOffsetOverflow(t *testing.T) {
 	// Publish some messages.
 	num := 5
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
@@ -488,16 +552,16 @@ func TestSubscribeOffsetOverflow(t *testing.T) {
 	// starting at offset 5.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(5), msg.Offset)
+		require.Equal(t, int64(5), msg.Offset())
 		close(gotMsg)
 		cancel()
 	}, lift.StartAtOffset(100))
 	require.NoError(t, err)
 
 	// Publish one more message.
-	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	_, err = client.Publish(context.Background(), name, []byte("test"))
 	require.NoError(t, err)
 
 	// Wait to get the new message.
@@ -539,16 +603,16 @@ func TestSubscribeOffsetOverflowEmptyStream(t *testing.T) {
 	// starting at offset 0.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(0), msg.Offset)
+		require.Equal(t, int64(0), msg.Offset())
 		close(gotMsg)
 		cancel()
 	})
 	require.NoError(t, err)
 
 	// Publish message.
-	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	_, err = client.Publish(context.Background(), name, []byte("test"))
 	require.NoError(t, err)
 
 	// Wait to get the message.
@@ -571,8 +635,8 @@ func TestSubscribeOffsetUnderflow(t *testing.T) {
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	// Set these to force deletion so we can get an underflow.
-	s1Config.Log.SegmentMaxBytes = 1
-	s1Config.Log.RetentionMaxBytes = 1
+	s1Config.Streams.SegmentMaxBytes = 1
+	s1Config.Streams.RetentionMaxBytes = 1
 	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -593,8 +657,9 @@ func TestSubscribeOffsetUnderflow(t *testing.T) {
 	// Publish some messages.
 	num := 2
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
@@ -604,9 +669,9 @@ func TestSubscribeOffsetUnderflow(t *testing.T) {
 	// Subscribe with underflowed offset. This should set the offset to 1.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(1), msg.Offset)
+		require.Equal(t, int64(1), msg.Offset())
 		close(gotMsg)
 		cancel()
 	}, lift.StartAtOffset(0))
@@ -631,68 +696,8 @@ func TestStreamRetentionBytes(t *testing.T) {
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
-	s1Config.Log.SegmentMaxBytes = 1
-	s1Config.Log.RetentionMaxBytes = 1000
-	s1Config.BatchMaxMessages = 1
-	s1 := runServerWithConfig(t, s1Config)
-	defer s1.Stop()
-
-	// Wait for server to elect itself leader.
-	getMetadataLeader(t, 10*time.Second, s1)
-
-	client, err := lift.Connect([]string{"localhost:5050"})
-	require.NoError(t, err)
-	defer client.Close()
-
-	// Create stream.
-	name := "foo"
-	subject := "foo"
-	err = client.CreateStream(context.Background(), subject, name)
-	require.NoError(t, err)
-
-	// Publish some messages.
-	num := 100
-	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
-		require.NoError(t, err)
-	}
-
-	// Force log clean.
-	forceLogClean(t, subject, name, s1)
-
-	// The first message read back should have offset 87.
-	msgs := make(chan *proto.Message, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
-		require.NoError(t, err)
-		msgs <- msg
-		cancel()
-	}, lift.StartAtEarliestReceived())
-	require.NoError(t, err)
-
-	// Wait to get the new message.
-	select {
-	case msg := <-msgs:
-		require.Equal(t, int64(87), msg.Offset)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Did not receive expected message")
-	}
-}
-
-// Ensure the stream messages retention ensures data is deleted when the log
-// exceeds the limit.
-func TestStreamRetentionMessages(t *testing.T) {
-	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
-	// Configure server.
-	s1Config := getTestConfig("a", true, 5050)
-	s1Config.Log.SegmentMaxBytes = 1
-	s1Config.Log.RetentionMaxMessages = 5
+	s1Config.Streams.SegmentMaxBytes = 1
+	s1Config.Streams.RetentionMaxBytes = 100
 	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -713,18 +718,19 @@ func TestStreamRetentionMessages(t *testing.T) {
 	// Publish some messages.
 	num := 10
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
 	// Force log clean.
 	forceLogClean(t, subject, name, s1)
 
-	// The first message read back should have offset 5.
-	msgs := make(chan *proto.Message, 1)
+	// The first message read back should have offset 9.
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -734,15 +740,15 @@ func TestStreamRetentionMessages(t *testing.T) {
 	// Wait to get the new message.
 	select {
 	case msg := <-msgs:
-		require.Equal(t, int64(5), msg.Offset)
+		require.Equal(t, int64(9), msg.Offset())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
 }
 
-// Ensure the stream message age retention ensures data is deleted when log
-// segments exceed the TTL.
-func TestStreamRetentionAge(t *testing.T) {
+// Ensure the stream messages retention ensures data is deleted when the log
+// exceeds the limit.
+func TestStreamRetentionMessages(t *testing.T) {
 	defer cleanupStorage(t)
 
 	// Use a central NATS server.
@@ -751,8 +757,8 @@ func TestStreamRetentionAge(t *testing.T) {
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
-	s1Config.Log.SegmentMaxBytes = 1
-	s1Config.Log.RetentionMaxAge = time.Nanosecond
+	s1Config.Streams.SegmentMaxBytes = 1
+	s1Config.Streams.RetentionMaxMessages = 5
 	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -771,21 +777,21 @@ func TestStreamRetentionAge(t *testing.T) {
 	require.NoError(t, err)
 
 	// Publish some messages.
-	num := 100
+	num := 10
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
 	// Force log clean.
 	forceLogClean(t, subject, name, s1)
 
-	// We expect all segments but the last to be truncated due to age, so the
-	// first message read back should have offset 99.
-	msgs := make(chan *proto.Message, 1)
+	// The first message read back should have offset 5.
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -795,14 +801,15 @@ func TestStreamRetentionAge(t *testing.T) {
 	// Wait to get the new message.
 	select {
 	case msg := <-msgs:
-		require.Equal(t, int64(99), msg.Offset)
+		require.Equal(t, int64(5), msg.Offset())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
 }
 
-// Ensure Subscribe returns an error when an invalid StartPosition is used.
-func TestSubscribeStartPositionInvalid(t *testing.T) {
+// Ensure the stream message age retention ensures data is deleted when log
+// segments exceed the TTL.
+func TestStreamRetentionAge(t *testing.T) {
 	defer cleanupStorage(t)
 
 	// Use a central NATS server.
@@ -811,6 +818,9 @@ func TestSubscribeStartPositionInvalid(t *testing.T) {
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Streams.SegmentMaxBytes = 1
+	s1Config.Streams.RetentionMaxAge = time.Nanosecond
+	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
 
@@ -827,10 +837,36 @@ func TestSubscribeStartPositionInvalid(t *testing.T) {
 	err = client.CreateStream(context.Background(), subject, name)
 	require.NoError(t, err)
 
-	// Subscribe with invalid StartPosition.
-	err = client.Subscribe(context.Background(), subject, name, nil, lift.StartAt(9999))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "Unknown StartPosition")
+	// Publish some messages.
+	num := 10
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// We expect all segments but the last to be truncated due to age, so the
+	// first message read back should have offset 9.
+	msgs := make(chan *lift.Message, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, int64(9), msg.Offset())
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
 }
 
 // Ensure when StartPosition_EARLIEST is used with Subscribe, messages are read
@@ -845,8 +881,8 @@ func TestSubscribeEarliest(t *testing.T) {
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	// Set these to force deletion.
-	s1Config.Log.SegmentMaxBytes = 1
-	s1Config.Log.RetentionMaxBytes = 1
+	s1Config.Streams.SegmentMaxBytes = 1
+	s1Config.Streams.RetentionMaxBytes = 1
 	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -867,8 +903,9 @@ func TestSubscribeEarliest(t *testing.T) {
 	// Publish some messages.
 	num := 2
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
@@ -878,9 +915,9 @@ func TestSubscribeEarliest(t *testing.T) {
 	// Subscribe with EARLIEST. This should start reading from offset 1.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(1), msg.Offset)
+		require.Equal(t, int64(1), msg.Offset())
 		close(gotMsg)
 		cancel()
 	}, lift.StartAtEarliestReceived())
@@ -923,17 +960,18 @@ func TestSubscribeLatest(t *testing.T) {
 	// Publish some messages.
 	num := 3
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
 	// Subscribe with LATEST. This should start reading from offset 2.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(2), msg.Offset)
+		require.Equal(t, int64(2), msg.Offset())
 		close(gotMsg)
 		cancel()
 	}, lift.StartAtLatestReceived())
@@ -976,8 +1014,9 @@ func TestSubscribeNewOnly(t *testing.T) {
 	// Publish some messages.
 	num := 5
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
@@ -985,16 +1024,16 @@ func TestSubscribeNewOnly(t *testing.T) {
 	// offset 5.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
-		require.Equal(t, int64(5), msg.Offset)
+		require.Equal(t, int64(5), msg.Offset())
 		close(gotMsg)
 		cancel()
 	})
 	require.NoError(t, err)
 
 	// Publish one more message.
-	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	_, err = client.Publish(context.Background(), name, []byte("test"))
 	require.NoError(t, err)
 
 	// Wait to get the new message.
@@ -1045,23 +1084,24 @@ func TestSubscribeStartTime(t *testing.T) {
 	// Publish some messages.
 	num := 5
 	for i := 0; i < num; i++ {
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = client.Publish(ctx, subject, []byte("hello"))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, name, []byte("hello"))
 		require.NoError(t, err)
 	}
 
 	// Subscribe with TIMESTAMP 25. This should start reading from offset 3.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, subject, name, func(msg *proto.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		select {
 		case <-gotMsg:
 			return
 		default:
 		}
 		require.NoError(t, err)
-		require.Equal(t, int64(3), msg.Offset)
-		require.Equal(t, int64(30), msg.Timestamp)
+		require.Equal(t, int64(3), msg.Offset())
+		require.Equal(t, int64(30), msg.Timestamp().UnixNano())
 		close(gotMsg)
 		cancel()
 	}, lift.StartAtTime(time.Unix(0, 25)))
@@ -1083,7 +1123,7 @@ func TestTLS(t *testing.T) {
 	defer ns.Shutdown()
 
 	// Configure server with TLS.
-	s1Config, err := NewConfig("./configs/tls.conf")
+	s1Config, err := NewConfig("./configs/tls.yaml")
 	require.NoError(t, err)
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -1098,5 +1138,535 @@ func TestTLS(t *testing.T) {
 
 	// Connecting without a cert should fail.
 	_, err = lift.Connect([]string{"localhost:5050"})
+	require.Error(t, err)
+}
+
+// Ensure that the host address is the same as the listen address when
+// specifying only the latter
+func TestListen(t *testing.T) {
+	config, err := NewConfig("./configs/listen.yaml")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen address is the same as the host address when
+// specifying only the latter
+func TestHost(t *testing.T) {
+	config, err := NewConfig("./configs/host.yaml")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen and connection addresses have the expected values
+// when specifying both
+func TestListenHost(t *testing.T) {
+	config, err := NewConfig("./configs/listen-host.yaml")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	ex = HostPort{
+		Host: "my-host",
+		Port: 4333,
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen and connection addresses have the expected default
+// values
+func TestDefaultListenHost(t *testing.T) {
+	config := NewDefaultConfig()
+
+	ex := HostPort{
+		Host: defaultListenAddress,
+		Port: DefaultPort,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	ex = HostPort{
+		Host: defaultConnectionAddress,
+		Port: DefaultPort,
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure the leader flag is set when the server is elected metadata leader and
+// unset when it loses leadership.
+func TestMetadataLeadershipLifecycle(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 0)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 0)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	// Check leader flag is set.
+	require.Equal(t, int64(1), atomic.LoadInt64(&(s1.getRaft().leader)))
+
+	// Kill the follower.
+	s2.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		leader := atomic.LoadInt64(&(s1.getRaft().leader))
+		if leader == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+		continue
+	}
+	t.Fatal("Expected leader flag to be 0")
+}
+
+// Ensure propagation handlers for shrinking and expanding the ISR work
+// correctly.
+func TestPropagatedShrinkExpandISR(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 0)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Wait for server to elect itself leader.
+	controller := getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name,
+		lift.ReplicationFactor(2))
+	require.NoError(t, err)
+
+	waitForISR(t, 10*time.Second, name, 0, 2, s1, s2)
+
+	leader := getPartitionLeader(t, 10*time.Second, name, 0, s1, s2)
+	followerID := s1.config.Clustering.ServerID
+	if leader == s1 {
+		followerID = s2.config.Clustering.ServerID
+	}
+	partition := leader.metadata.GetPartition(name, 0)
+	require.NotNil(t, partition)
+	leaderEpoch := partition.LeaderEpoch
+
+	// Shrink ISR.
+	controller.handleShrinkISR(&proto.PropagatedRequest{
+		ShrinkISROp: &proto.ShrinkISROp{
+			Stream:          name,
+			Partition:       0,
+			ReplicaToRemove: followerID,
+			Leader:          leader.config.Clustering.ServerID,
+			LeaderEpoch:     leaderEpoch,
+		},
+	})
+
+	// Wait for ISR to shrink.
+	waitForISR(t, 10*time.Second, name, 0, 1, s1, s2)
+
+	// Expand ISR.
+	controller.handleExpandISR(&proto.PropagatedRequest{
+		Op: proto.Op_EXPAND_ISR,
+		ExpandISROp: &proto.ExpandISROp{
+			Stream:       name,
+			Partition:    0,
+			ReplicaToAdd: followerID,
+			Leader:       leader.config.Clustering.ServerID,
+			LeaderEpoch:  leaderEpoch,
+		},
+	})
+
+	// Wait for ISR to expand.
+	waitForISR(t, 10*time.Second, name, 0, 2, s1, s2)
+}
+
+// Test stream pausing and resuming. A paused stream should re-activate itself
+// when a message is published using the Liftbridge API. This test pauses all
+// partitions and checks that only the partition that is published to gets
+// resumed.
+func TestPauseStreamAllPartitions(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	// Try to pause a non-existing stream.
+	err = client.PauseStream(context.Background(), "bar")
+	require.Error(t, err)
+
+	// Pause all partitions.
+	err = client.PauseStream(context.Background(), name)
+	require.NoError(t, err)
+
+	// Make sure pause is idempotent.
+	err = client.PauseStream(context.Background(), name)
+	require.NoError(t, err)
+
+	// Check that both partitions are paused.
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, true, s1)
+
+	// Publish a message to partition 0.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.NoError(t, err)
+
+	msgs := make(chan *lift.Message, 1)
+	ctx, cancel = context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, []byte("hello"), msg.Value())
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+
+	// Check that partition 0 was resumed but partition 1 is still paused.
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, true, s1)
+}
+
+// Test stream pausing and resuming. A paused stream should re-activate itself
+// when a message is published using the Liftbridge API. This test pauses some
+// partitions only.
+func TestPauseStreamSomePartitions(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	// Try to pause a non-existing partition.
+	err = client.PauseStream(context.Background(), name, lift.PausePartitions(99))
+	require.Error(t, err)
+
+	// Pause partition 0 but set ResumeAll.
+	err = client.PauseStream(context.Background(), name, lift.PausePartitions(0), lift.ResumeAll())
+	require.NoError(t, err)
+
+	// Check that only partition 0 is paused.
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, false, s1)
+
+	// Publish a message to the non-paused partition, which should resume the
+	// paused partition since ResumeAll was enabled.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(1))
+	require.NoError(t, err)
+
+	msgs := make(chan *lift.Message, 1)
+	ctx, cancel = context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived(), lift.Partition(1))
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, []byte("hello"), msg.Value())
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+
+	// Check that both partitions are resumed.
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, false, s1)
+}
+
+// Ensure pausing a stream works when we send the request to the metadata
+// follower and resuming the stream works when the resuming publish is sent to
+// the follower.
+func TestPauseStreamPropagate(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 0)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 5050)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Connect and send the request to the follower.
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	name := "foo"
+	err = client.CreateStream(ctx, "foo", name)
+	require.NoError(t, err)
+
+	// Pause stream on follower.
+	err = client.PauseStream(context.Background(), name)
+	require.NoError(t, err)
+
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s2)
+
+	// Resume stream by publishing to follower.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.NoError(t, err)
+
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s2)
+}
+
+// Ensure the ISR is maintained across partition pauses.
+func TestPauseStreamMaintainISR(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Clustering.ReplicaMaxLagTime = 2 * time.Second
+	s1Config.Clustering.ReplicaMaxIdleWait = 0
+	s1Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 0)
+	s2Config.Clustering.ReplicaMaxLagTime = 2 * time.Second
+	s2Config.Clustering.ReplicaMaxIdleWait = 0
+	s2Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Configure third server.
+	s3Config := getTestConfig("c", false, 0)
+	s3Config.Clustering.ReplicaMaxLagTime = 2 * time.Second
+	s3Config.Clustering.ReplicaMaxIdleWait = 0
+	s3Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
+	s3 := runServerWithConfig(t, s3Config)
+	defer s3.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1, s2, s3)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	name := "foo"
+	err = client.CreateStream(ctx, "foo", name, lift.ReplicationFactor(3))
+	require.NoError(t, err)
+
+	// Check the ISR size is 3.
+	waitForISR(t, 5*time.Second, name, 0, 3, s1, s2, s3)
+
+	// Kill a replica.
+	s2.Stop()
+
+	// Ensure ISR size shrinks to 2.
+	waitForISR(t, 10*time.Second, name, 0, 2, s1, s3)
+
+	// Pause stream.
+	err = client.PauseStream(context.Background(), name)
+	require.NoError(t, err)
+
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s3)
+
+	// Resume stream by publishing.
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.NoError(t, err)
+
+	// Ensure stream is resumed.
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s3)
+
+	// Ensure ISR size is still 2.
+	waitForISR(t, 10*time.Millisecond, name, 0, 2, s1, s3)
+}
+
+// Ensure publishing to a non-existent stream returns an error.
+func TestPublishNoSuchStream(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	_, err = client.Publish(context.Background(), "foo", []byte("hello"))
+	require.Error(t, err)
+}
+
+// Ensure publishing to a non-existent stream partition returns an error.
+func TestPublishNoSuchPartition(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	_, err = client.Publish(context.Background(), name, []byte("hello"), lift.ToPartition(42))
 	require.Error(t, err)
 }

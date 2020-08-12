@@ -1,6 +1,7 @@
 package commitlog
 
 import (
+	"context"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -8,17 +9,18 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
-
-	"github.com/liftbridge-io/liftbridge/server/proto"
 )
 
 var (
-	msgs = []*proto.Message{
-		&proto.Message{Value: []byte("one"), Timestamp: 1, LeaderEpoch: 42},
-		&proto.Message{Value: []byte("two"), Timestamp: 2, LeaderEpoch: 42},
-		&proto.Message{Value: []byte("three"), Timestamp: 3, LeaderEpoch: 42},
-		&proto.Message{Value: []byte("four"), Timestamp: 4, LeaderEpoch: 42},
+	headers = map[string][]byte{
+		"foo": []byte("bar"),
+	}
+	msgs = []*Message{
+		{Value: []byte("one"), Timestamp: 1, LeaderEpoch: 42, Headers: headers},
+		{Value: []byte("two"), Timestamp: 2, LeaderEpoch: 42, Headers: headers},
+		{Value: []byte("three"), Timestamp: 3, LeaderEpoch: 42, Headers: headers},
+		{Value: []byte("four"), Timestamp: 4, LeaderEpoch: 42, Headers: headers},
+		{Value: nil, Timestamp: 5, LeaderEpoch: 42, Headers: headers},
 	}
 )
 
@@ -30,6 +32,40 @@ func TestNewCommitLog(t *testing.T) {
 
 	_, err = l.Append(msgs)
 	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r, err := l.NewReader(0, true)
+	require.NoError(t, err)
+
+	headers := make([]byte, 28)
+	for i, exp := range msgs {
+		msg, offset, timestamp, leaderEpoch, err := r.ReadMessage(ctx, headers)
+		require.NoError(t, err)
+		require.Equal(t, int64(i), offset)
+		require.Equal(t, msgs[i].Timestamp, timestamp)
+		require.Equal(t, msgs[i].LeaderEpoch, leaderEpoch)
+		require.Equal(t, []byte("bar"), msg.Headers()["foo"])
+		compareMessages(t, exp, msg)
+	}
+}
+
+func TestNewCommitLogEmptyPath(t *testing.T) {
+	_, err := New(Options{})
+	require.Error(t, err)
+}
+
+func TestAppendMessageSet(t *testing.T) {
+	var err error
+	l, cleanup := setup(t)
+	defer l.Close()
+	defer cleanup()
+
+	set, _, err := newMessageSetFromProto(0, 0, msgs)
+	require.NoError(t, err)
+
+	offsets, err := l.AppendMessageSet(set)
+	require.NoError(t, err)
+	require.Equal(t, []int64{0, 1, 2, 3, 4}, offsets)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r, err := l.NewReader(0, true)
@@ -59,12 +95,12 @@ func TestCommitLogRecover(t *testing.T) {
 
 			// Append some messages.
 			numMsgs := 10
-			msgs := make([]*proto.Message, numMsgs)
+			msgs := make([]*Message, numMsgs)
 			for i := 0; i < numMsgs; i++ {
-				msgs[i] = &proto.Message{Value: []byte(strconv.Itoa(i))}
+				msgs[i] = &Message{Value: []byte(strconv.Itoa(i))}
 			}
 			for _, msg := range msgs {
-				_, err := l.Append([]*proto.Message{msg})
+				_, err := l.Append([]*Message{msg})
 				require.NoError(t, err)
 			}
 
@@ -124,6 +160,17 @@ func TestCommitLogRecoverHW(t *testing.T) {
 	require.Equal(t, int64(100), l.HighWatermark())
 }
 
+func TestOverrideHighWatermark(t *testing.T) {
+	l, cleanup := setup(t)
+	defer l.Close()
+	defer cleanup()
+
+	l.SetHighWatermark(100)
+	require.Equal(t, int64(100), l.HighWatermark())
+	l.OverrideHighWatermark(90)
+	require.Equal(t, int64(90), l.HighWatermark())
+}
+
 func BenchmarkCommitLog(b *testing.B) {
 	var err error
 	l, cleanup := setup(b)
@@ -147,9 +194,9 @@ func TestOffsets(t *testing.T) {
 	require.Equal(t, int64(-1), l.NewestOffset())
 
 	numMsgs := 5
-	msgs := make([]*proto.Message, numMsgs)
+	msgs := make([]*Message, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		msgs[i] = &proto.Message{Value: []byte(strconv.Itoa(i))}
+		msgs[i] = &Message{Value: []byte(strconv.Itoa(i))}
 	}
 	_, err := l.Append(msgs)
 	require.NoError(t, err)
@@ -181,7 +228,7 @@ func TestCleaner(t *testing.T) {
 	_, err = l.Append(msgs)
 	require.NoError(t, err)
 
-	l.Clean()
+	require.NoError(t, l.Clean())
 
 	require.Equal(t, 1, len(l.Segments()))
 	for i, s := range l.Segments() {
@@ -205,7 +252,7 @@ func TestCleanerDeleteLeaderEpochOffsets(t *testing.T) {
 
 	// Add some messages.
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 1,
@@ -214,7 +261,7 @@ func TestCleanerDeleteLeaderEpochOffsets(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i + 5)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 2,
@@ -223,7 +270,7 @@ func TestCleanerDeleteLeaderEpochOffsets(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i + 10)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 3,
@@ -270,7 +317,7 @@ func TestCleanerReplaceLeaderEpochOffsets(t *testing.T) {
 
 	// Add some messages.
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Key:         []byte("foo"),
 			Value:       []byte(strconv.Itoa(i)),
 			Timestamp:   time.Now().UnixNano(),
@@ -280,7 +327,7 @@ func TestCleanerReplaceLeaderEpochOffsets(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Key:         []byte("bar"),
 			Value:       []byte(strconv.Itoa(i + 5)),
 			Timestamp:   time.Now().UnixNano(),
@@ -290,7 +337,7 @@ func TestCleanerReplaceLeaderEpochOffsets(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Key:         []byte("baz"),
 			Value:       []byte(strconv.Itoa(i + 10)),
 			Timestamp:   time.Now().UnixNano(),
@@ -337,12 +384,12 @@ func TestOffsetForTimestamp(t *testing.T) {
 
 	// Append some messages.
 	numMsgs := 10
-	msgs := make([]*proto.Message, numMsgs)
+	msgs := make([]*Message, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		msgs[i] = &proto.Message{Value: []byte(strconv.Itoa(i)), Timestamp: int64(i * 10)}
+		msgs[i] = &Message{Value: []byte(strconv.Itoa(i)), Timestamp: int64(i * 10)}
 	}
 	for _, msg := range msgs {
-		_, err := l.Append([]*proto.Message{msg})
+		_, err := l.Append([]*Message{msg})
 		require.NoError(t, err)
 	}
 
@@ -390,7 +437,7 @@ func TestTruncate(t *testing.T) {
 
 	// Add some messages.
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 1,
@@ -399,7 +446,7 @@ func TestTruncate(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i + 5)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 2,
@@ -408,7 +455,7 @@ func TestTruncate(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_, err := l.Append([]*proto.Message{&proto.Message{
+		_, err := l.Append([]*Message{{
 			Value:       []byte(strconv.Itoa(i + 10)),
 			Timestamp:   time.Now().UnixNano(),
 			LeaderEpoch: 3,
@@ -433,7 +480,115 @@ func TestTruncate(t *testing.T) {
 	require.Equal(t, int64(5), l.LastOffsetForLeaderEpoch(1))
 }
 
-func setup(t require.TestingT) (*CommitLog, func()) {
+// Ensure NotifyLEO returns a closed channel when the given offset is not the
+// current log end offset.
+func TestNotifyLEOMismatch(t *testing.T) {
+	l, cleanup := setup(t)
+	defer l.Close()
+	defer cleanup()
+
+	// Add some messages.
+	for i := 0; i < 5; i++ {
+		_, err := l.Append([]*Message{{
+			Value:       []byte(strconv.Itoa(i)),
+			Timestamp:   time.Now().UnixNano(),
+			LeaderEpoch: 1,
+		}})
+		require.NoError(t, err)
+	}
+
+	// Get current log end offset and then add another message.
+	leo := l.NewestOffset()
+	_, err := l.Append([]*Message{{
+		Value:       []byte(strconv.Itoa(5)),
+		Timestamp:   time.Now().UnixNano(),
+		LeaderEpoch: 1,
+	}})
+	require.NoError(t, err)
+
+	// Notify LEO should return a closed channel because the LEO is different
+	// than the expected LEO.
+	waiter := struct{}{}
+	ch := l.NotifyLEO(waiter, leo)
+	select {
+	case <-ch:
+	default:
+		t.Fatalf("Expected closed channel")
+	}
+}
+
+// Ensure NotifyLEO returns a channel that is closed once more data is written
+// to the log past the log end offset.
+func TestNotifyLEONewData(t *testing.T) {
+	l, cleanup := setupWithOptions(t, Options{
+		Path:            tempDir(t),
+		MaxSegmentBytes: 256,
+	})
+	defer l.Close()
+	defer cleanup()
+
+	// Add some messages.
+	for i := 0; i < 5; i++ {
+		_, err := l.Append([]*Message{{
+			Value:       []byte(strconv.Itoa(i)),
+			Timestamp:   time.Now().UnixNano(),
+			LeaderEpoch: 1,
+		}})
+		require.NoError(t, err)
+	}
+
+	// Get current log end offset.
+	leo := l.NewestOffset()
+
+	// Register a waiter.
+	waiter := struct{}{}
+	ch := l.NotifyLEO(waiter, leo)
+
+	select {
+	case <-ch:
+		t.Fatalf("Unexpected channel close")
+	default:
+	}
+
+	// Add another message.
+	_, err := l.Append([]*Message{{
+		Value:       []byte(strconv.Itoa(5)),
+		Timestamp:   time.Now().UnixNano(),
+		LeaderEpoch: 1,
+	}})
+	require.NoError(t, err)
+
+	select {
+	case <-ch:
+	default:
+		t.Fatalf("Expected channel to close")
+	}
+}
+
+// Ensure NotifyLEO returns the same channel if the waiter is already
+// registered in the log.
+func TestNotifyLEOIdempotent(t *testing.T) {
+	l, cleanup := setupWithOptions(t, Options{
+		Path:            tempDir(t),
+		MaxSegmentBytes: 256,
+	})
+	defer l.Close()
+	defer cleanup()
+
+	// Get current log end offset.
+	leo := l.NewestOffset()
+
+	// Register a waiter.
+	waiter := struct{}{}
+	ch1 := l.NotifyLEO(waiter, leo)
+
+	// Register the same waiter again. This should return the same channel.
+	ch2 := l.NotifyLEO(waiter, leo)
+
+	require.Equal(t, ch1, ch2)
+}
+
+func setup(t require.TestingT) (*commitLog, func()) {
 	opts := Options{
 		Path:            tempDir(t),
 		MaxSegmentBytes: 6,
@@ -442,10 +597,10 @@ func setup(t require.TestingT) (*CommitLog, func()) {
 	return setupWithOptions(t, opts)
 }
 
-func setupWithOptions(t require.TestingT, opts Options) (*CommitLog, func()) {
+func setupWithOptions(t require.TestingT, opts Options) (*commitLog, func()) {
 	l, err := New(opts)
 	require.NoError(t, err)
-	return l, func() {
+	return l.(*commitLog), func() {
 		remove(t, opts.Path)
 	}
 }

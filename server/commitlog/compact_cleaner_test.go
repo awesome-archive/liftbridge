@@ -1,14 +1,12 @@
 package commitlog
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
-
-	"github.com/liftbridge-io/liftbridge/server/proto"
 )
 
 type keyValue struct {
@@ -18,13 +16,13 @@ type keyValue struct {
 
 type expectedMsg struct {
 	Offset int64
-	Msg    *proto.Message
+	Msg    *Message
 }
 
 // Ensure Compact is a no-op when there are no segments.
 func TestCompactCleanerNoSegments(t *testing.T) {
-	opts := CompactCleanerOptions{Name: "foo", Logger: noopLogger()}
-	cleaner := NewCompactCleaner(opts)
+	opts := compactCleanerOptions{Name: "foo", Logger: noopLogger()}
+	cleaner := newCompactCleaner(opts)
 	segments, epochCache, err := cleaner.Compact(0, nil)
 	require.NoError(t, err)
 	require.Nil(t, segments)
@@ -33,12 +31,12 @@ func TestCompactCleanerNoSegments(t *testing.T) {
 
 // Ensure Compact is a no-op when there is one segment.
 func TestCompactCleanerOneSegment(t *testing.T) {
-	opts := CompactCleanerOptions{Name: "foo", Logger: noopLogger()}
-	cleaner := NewCompactCleaner(opts)
+	opts := compactCleanerOptions{Name: "foo", Logger: noopLogger()}
+	cleaner := newCompactCleaner(opts)
 	dir := tempDir(t)
 	defer remove(t, dir)
 
-	expected := []*Segment{createSegment(t, dir, 0, 100)}
+	expected := []*segment{createSegment(t, dir, 0, 100)}
 	actual, epochCache, err := cleaner.Compact(0, expected)
 	require.NoError(t, err)
 	require.Equal(t, expected, actual)
@@ -58,16 +56,16 @@ func TestCompactCleaner(t *testing.T) {
 
 	// Append some messages.
 	entries := []keyValue{
-		keyValue{[]byte("foo"), []byte("first")},
-		keyValue{[]byte("bar"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("second")},
-		keyValue{[]byte("foo"), []byte("third")},
-		keyValue{[]byte("bar"), []byte("second")},
-		keyValue{[]byte("baz"), []byte("first")},
-		keyValue{[]byte("baz"), []byte("second")},
-		keyValue{[]byte("qux"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("fourth")},
-		keyValue{[]byte("baz"), []byte("third")},
+		{[]byte("foo"), []byte("first")},
+		{[]byte("bar"), []byte("first")},
+		{[]byte("foo"), []byte("second")},
+		{[]byte("foo"), []byte("third")},
+		{[]byte("bar"), []byte("second")},
+		{[]byte("baz"), []byte("first")},
+		{[]byte("baz"), []byte("second")},
+		{[]byte("qux"), []byte("first")},
+		{[]byte("foo"), []byte("fourth")},
+		{[]byte("baz"), []byte("third")},
 	}
 	appendToLog(t, l, entries, true)
 
@@ -75,11 +73,11 @@ func TestCompactCleaner(t *testing.T) {
 	require.NoError(t, l.Clean())
 
 	expected := []*expectedMsg{
-		&expectedMsg{Offset: 4, Msg: &proto.Message{Key: []byte("bar"), Value: []byte("second")}},
-		&expectedMsg{Offset: 7, Msg: &proto.Message{Key: []byte("qux"), Value: []byte("first")}},
-		&expectedMsg{Offset: 8, Msg: &proto.Message{Key: []byte("foo"), Value: []byte("fourth")}},
+		{Offset: 4, Msg: &Message{Key: []byte("bar"), Value: []byte("second")}},
+		{Offset: 7, Msg: &Message{Key: []byte("qux"), Value: []byte("first")}},
+		{Offset: 8, Msg: &Message{Key: []byte("foo"), Value: []byte("fourth")}},
 		// This one is present because it's in the active segment.
-		&expectedMsg{Offset: 9, Msg: &proto.Message{Key: []byte("baz"), Value: []byte("third")}},
+		{Offset: 9, Msg: &Message{Key: []byte("baz"), Value: []byte("third")}},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,16 +105,16 @@ func TestCompactCleanerHW(t *testing.T) {
 
 	// Append some messages.
 	entries := []keyValue{
-		keyValue{[]byte("foo"), []byte("first")},
-		keyValue{[]byte("bar"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("second")},
-		keyValue{[]byte("foo"), []byte("third")},
-		keyValue{[]byte("bar"), []byte("second")},
-		keyValue{[]byte("baz"), []byte("first")},
-		keyValue{[]byte("baz"), []byte("second")},
-		keyValue{[]byte("qux"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("fourth")},
-		keyValue{[]byte("baz"), []byte("third")},
+		{[]byte("foo"), []byte("first")},
+		{[]byte("bar"), []byte("first")},
+		{[]byte("foo"), []byte("second")},
+		{[]byte("foo"), []byte("third")},
+		{[]byte("bar"), []byte("second")},
+		{[]byte("baz"), []byte("first")},
+		{[]byte("baz"), []byte("second")},
+		{[]byte("qux"), []byte("first")},
+		{[]byte("foo"), []byte("fourth")},
+		{[]byte("baz"), []byte("third")},
 	}
 	appendToLog(t, l, entries, false)
 	l.SetHighWatermark(5)
@@ -125,14 +123,14 @@ func TestCompactCleanerHW(t *testing.T) {
 	require.NoError(t, l.Clean())
 
 	expected := []*expectedMsg{
-		&expectedMsg{Offset: 3, Msg: &proto.Message{Key: []byte("foo"), Value: []byte("third")}},
-		&expectedMsg{Offset: 4, Msg: &proto.Message{Key: []byte("bar"), Value: []byte("second")}},
-		&expectedMsg{Offset: 5, Msg: &proto.Message{Key: []byte("baz"), Value: []byte("first")}},
+		{Offset: 3, Msg: &Message{Key: []byte("foo"), Value: []byte("third")}},
+		{Offset: 4, Msg: &Message{Key: []byte("bar"), Value: []byte("second")}},
+		{Offset: 5, Msg: &Message{Key: []byte("baz"), Value: []byte("first")}},
 		// These are retained because they are after the HW.
-		&expectedMsg{Offset: 6, Msg: &proto.Message{Key: []byte("baz"), Value: []byte("second")}},
-		&expectedMsg{Offset: 7, Msg: &proto.Message{Key: []byte("qux"), Value: []byte("first")}},
-		&expectedMsg{Offset: 8, Msg: &proto.Message{Key: []byte("foo"), Value: []byte("fourth")}},
-		&expectedMsg{Offset: 9, Msg: &proto.Message{Key: []byte("baz"), Value: []byte("third")}},
+		{Offset: 6, Msg: &Message{Key: []byte("baz"), Value: []byte("second")}},
+		{Offset: 7, Msg: &Message{Key: []byte("qux"), Value: []byte("first")}},
+		{Offset: 8, Msg: &Message{Key: []byte("foo"), Value: []byte("fourth")}},
+		{Offset: 9, Msg: &Message{Key: []byte("baz"), Value: []byte("third")}},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -160,10 +158,10 @@ func TestCompactCleanerNoKeys(t *testing.T) {
 
 	// Append some messages.
 	entries := []keyValue{
-		keyValue{nil, []byte("first")},
-		keyValue{nil, []byte("second")},
-		keyValue{nil, []byte("third")},
-		keyValue{nil, []byte("fourth")},
+		{nil, []byte("first")},
+		{nil, []byte("second")},
+		{nil, []byte("third")},
+		{nil, []byte("fourth")},
 	}
 	appendToLog(t, l, entries, true)
 
@@ -171,10 +169,10 @@ func TestCompactCleanerNoKeys(t *testing.T) {
 	require.NoError(t, l.Clean())
 
 	expected := []*expectedMsg{
-		&expectedMsg{Offset: 0, Msg: &proto.Message{Value: []byte("first")}},
-		&expectedMsg{Offset: 1, Msg: &proto.Message{Value: []byte("second")}},
-		&expectedMsg{Offset: 2, Msg: &proto.Message{Value: []byte("third")}},
-		&expectedMsg{Offset: 3, Msg: &proto.Message{Value: []byte("fourth")}},
+		{Offset: 0, Msg: &Message{Value: []byte("first")}},
+		{Offset: 1, Msg: &Message{Value: []byte("second")}},
+		{Offset: 2, Msg: &Message{Value: []byte("third")}},
+		{Offset: 3, Msg: &Message{Value: []byte("fourth")}},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,16 +214,16 @@ func TestCompactCleanerTruncateConcurrent(t *testing.T) {
 
 	// Append some messages.
 	entries := []keyValue{
-		keyValue{[]byte("foo"), []byte("first")},
-		keyValue{[]byte("bar"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("second")},
-		keyValue{[]byte("foo"), []byte("third")},
-		keyValue{[]byte("bar"), []byte("second")},
-		keyValue{[]byte("baz"), []byte("first")},
-		keyValue{[]byte("baz"), []byte("second")},
-		keyValue{[]byte("qux"), []byte("first")},
-		keyValue{[]byte("foo"), []byte("fourth")},
-		keyValue{[]byte("baz"), []byte("third")},
+		{[]byte("foo"), []byte("first")},
+		{[]byte("bar"), []byte("first")},
+		{[]byte("foo"), []byte("second")},
+		{[]byte("foo"), []byte("third")},
+		{[]byte("bar"), []byte("second")},
+		{[]byte("baz"), []byte("first")},
+		{[]byte("baz"), []byte("second")},
+		{[]byte("qux"), []byte("first")},
+		{[]byte("foo"), []byte("fourth")},
+		{[]byte("baz"), []byte("third")},
 	}
 	appendToLog(t, l, entries, true)
 
@@ -282,11 +280,11 @@ func benchmarkClean(b *testing.B, segmentSize int64) {
 
 				buf := make([]byte, msgSize)
 				for i := 0; i < 200000; i++ {
-					msg := &proto.Message{
+					msg := &Message{
 						Key:   []byte(keys[rand.Intn(len(keys))]),
 						Value: buf,
 					}
-					offsets, err := l.Append([]*proto.Message{msg})
+					offsets, err := l.Append([]*Message{msg})
 					require.NoError(b, err)
 					l.SetHighWatermark(offsets[len(offsets)-1])
 				}
@@ -299,13 +297,13 @@ func benchmarkClean(b *testing.B, segmentSize int64) {
 	}
 }
 
-func appendToLog(t *testing.T, l *CommitLog, entries []keyValue, commit bool) {
+func appendToLog(t *testing.T, l *commitLog, entries []keyValue, commit bool) {
 	for _, entry := range entries {
-		msg := &proto.Message{
+		msg := &Message{
 			Key:   entry.key,
 			Value: entry.value,
 		}
-		offsets, err := l.Append([]*proto.Message{msg})
+		offsets, err := l.Append([]*Message{msg})
 		require.NoError(t, err)
 		if commit {
 			l.SetHighWatermark(offsets[len(offsets)-1])

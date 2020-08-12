@@ -1,20 +1,21 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
-	client "github.com/liftbridge-io/go-liftbridge/liftbridge-grpc"
-	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/liftbridge-io/liftbridge/server/proto"
+	client "github.com/liftbridge-io/liftbridge-api/go"
+
+	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
 
 const (
@@ -22,20 +23,27 @@ const (
 	maxReplicationFactor    int32 = -1
 )
 
-// ErrStreamExists is returned by CreateStream when attempting to create a
-// stream that already has the provided subject and name.
-var ErrStreamExists = errors.New("stream already exists")
+var (
+	// ErrStreamExists is returned by CreateStream when attempting to create a
+	// stream that already exists.
+	ErrStreamExists = errors.New("stream already exists")
 
-// subjectStreams maps a name to a stream within the scope of a subject.
-type subjectStreams map[string]*stream
+	// ErrStreamNotFound is returned by DeleteStream/PauseStream when
+	// attempting to delete/pause a stream that does not exist.
+	ErrStreamNotFound = errors.New("stream does not exist")
 
-// leaderReport tracks witnesses for a stream leader. Witnesses are replicas
+	// ErrPartitionNotFound is returned by PauseStream when attempting to pause
+	// a stream partition that does not exist.
+	ErrPartitionNotFound = errors.New("partition does not exist")
+)
+
+// leaderReport tracks witnesses for a partition leader. Witnesses are replicas
 // which have reported the leader as unresponsive. If a quorum of replicas
 // report the leader within a bounded period of time, the controller will
 // select a new leader.
 type leaderReport struct {
 	mu              sync.Mutex
-	stream          *stream
+	partition       *partition
 	timer           *time.Timer
 	witnessReplicas map[string]struct{}
 	api             *metadataAPI
@@ -53,15 +61,15 @@ func (l *leaderReport) addWitness(replica string) *status.Status {
 
 	var (
 		// Subtract 1 to exclude leader.
-		isrSize      = l.stream.ISRSize() - 1
-		leaderFailed = len(l.witnessReplicas) >= isrSize/2+1
+		isrSize      = l.partition.ISRSize() - 1
+		leaderFailed = len(l.witnessReplicas) > isrSize/2
 	)
 
 	if leaderFailed {
 		if l.timer != nil {
 			l.timer.Stop()
 		}
-		return l.api.electNewStreamLeader(l.stream)
+		return l.api.electNewPartitionLeader(l.partition)
 	}
 
 	if l.timer != nil {
@@ -70,7 +78,7 @@ func (l *leaderReport) addWitness(replica string) *status.Status {
 		l.timer = time.AfterFunc(
 			l.api.config.Clustering.ReplicaMaxLeaderTimeout, func() {
 				l.api.mu.Lock()
-				delete(l.api.leaderReports, l.stream)
+				delete(l.api.leaderReports, l.partition)
 				l.api.mu.Unlock()
 			})
 	}
@@ -90,9 +98,9 @@ func (l *leaderReport) cancel() {
 // stream access should go through the exported methods of the metadataAPI.
 type metadataAPI struct {
 	*Server
-	streams         map[string]subjectStreams
+	streams         map[string]*stream
 	mu              sync.RWMutex
-	leaderReports   map[*stream]*leaderReport
+	leaderReports   map[*partition]*leaderReport
 	cachedBrokers   []*client.Broker
 	cachedServerIDs map[string]struct{}
 	lastCached      time.Time
@@ -101,8 +109,8 @@ type metadataAPI struct {
 func newMetadataAPI(s *Server) *metadataAPI {
 	return &metadataAPI{
 		Server:        s,
-		streams:       make(map[string]subjectStreams),
-		leaderReports: make(map[*stream]*leaderReport),
+		streams:       make(map[string]*stream),
+		leaderReports: make(map[*partition]*leaderReport),
 	}
 }
 
@@ -176,21 +184,19 @@ func (m *metadataAPI) brokerCache(serverIDs map[string]struct{}) ([]*client.Brok
 // argument is the expected number of peers to get a response from.
 func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*client.Broker, *status.Status) {
 	// Add ourselves.
-	brokers := []*client.Broker{&client.Broker{
+	connectionAddress := m.config.GetConnectionAddress()
+	brokers := []*client.Broker{{
 		Id:   m.config.Clustering.ServerID,
-		Host: m.config.Host,
-		Port: int32(m.config.Port),
+		Host: connectionAddress.Host,
+		Port: int32(connectionAddress.Port),
 	}}
 
 	// Make sure there is a deadline on the request.
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultPropagateTimeout)
-		defer cancel()
-	}
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
 
 	// Create subscription to receive responses on.
-	inbox := nats.NewInbox()
+	inbox := m.getMetadataReplyInbox()
 	sub, err := m.ncRaft.SubscribeSync(inbox)
 	if err != nil {
 		return nil, status.New(codes.Internal, err.Error())
@@ -198,13 +204,13 @@ func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*cli
 	defer sub.Unsubscribe()
 
 	// Survey the cluster.
-	queryReq, err := (&proto.ServerInfoRequest{
+	queryReq, err := proto.MarshalServerInfoRequest(&proto.ServerInfoRequest{
 		Id: m.config.Clustering.ServerID,
-	}).Marshal()
+	})
 	if err != nil {
 		panic(err)
 	}
-	m.ncRaft.PublishRequest(m.serverInfoInbox(), inbox, queryReq)
+	m.ncRaft.PublishRequest(m.getServerInfoInbox(), inbox, queryReq)
 
 	// Gather responses.
 	for i := 0; i < numPeers; i++ {
@@ -212,8 +218,8 @@ func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*cli
 		if err != nil {
 			break
 		}
-		queryResp := &proto.ServerInfoResponse{}
-		if err := queryResp.Unmarshal(msg.Data); err != nil {
+		queryResp, err := proto.UnmarshalServerInfoResponse(msg.Data)
+		if err != nil {
 			m.logger.Warnf("Received invalid server info response: %v", err)
 			continue
 		}
@@ -228,37 +234,42 @@ func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*cli
 }
 
 // createMetadataResponse creates a FetchMetadataResponse and populates it with
-// stream metadata. If the provided list of StreamDescriptors is empty, it will
+// stream metadata. If the provided list of stream names is empty, it will
 // populate metadata for all streams. Otherwise, it populates only the
 // specified streams.
-func (m *metadataAPI) createMetadataResponse(streams []*client.StreamDescriptor) *client.FetchMetadataResponse {
-	// If no descriptors were provided, fetch metadata for all streams.
+func (m *metadataAPI) createMetadataResponse(streams []string) *client.FetchMetadataResponse {
+	// If no stream names were provided, fetch metadata for all streams.
 	if len(streams) == 0 {
 		for _, stream := range m.GetStreams() {
-			streams = append(streams, &client.StreamDescriptor{
-				Subject: stream.Subject,
-				Name:    stream.Name,
-			})
+			streams = append(streams, stream.GetName())
 		}
 	}
 
 	metadata := make([]*client.StreamMetadata, len(streams))
 
-	for i, descriptor := range streams {
-		stream := m.GetStream(descriptor.Subject, descriptor.Name)
+	for i, name := range streams {
+		stream := m.GetStream(name)
 		if stream == nil {
 			// Stream does not exist.
 			metadata[i] = &client.StreamMetadata{
-				Stream: descriptor,
-				Error:  client.StreamMetadata_UNKNOWN_STREAM,
+				Name:  name,
+				Error: client.StreamMetadata_UNKNOWN_STREAM,
 			}
 		} else {
-			leader, _ := stream.GetLeader()
+			partitions := make(map[int32]*client.PartitionMetadata)
+			for id, partition := range stream.GetPartitions() {
+				leader, _ := partition.GetLeader()
+				partitions[id] = &client.PartitionMetadata{
+					Id:       id,
+					Leader:   leader,
+					Replicas: partition.GetReplicas(),
+					Isr:      partition.GetISR(),
+				}
+			}
 			metadata[i] = &client.StreamMetadata{
-				Stream:   descriptor,
-				Leader:   leader,
-				Replicas: stream.GetReplicas(),
-				Isr:      stream.GetISR(),
+				Name:       name,
+				Subject:    stream.GetSubject(),
+				Partitions: partitions,
 			}
 		}
 	}
@@ -269,81 +280,231 @@ func (m *metadataAPI) createMetadataResponse(streams []*client.StreamDescriptor)
 // CreateStream creates a new stream if this server is the metadata leader. If
 // it is not, it will forward the request to the leader and return the
 // response. This operation is replicated by Raft. The metadata leader will
-// select replicationFactor nodes to participate in the stream and a leader. If
-// successful, this will return once the stream has been replicated to the
-// cluster and the stream leader has started.
-func (m *metadataAPI) CreateStream(ctx context.Context, req *client.CreateStreamRequest) *status.Status {
+// select replicationFactor nodes to participate and a leader for each
+// partition.  If successful, this will return once the partitions have been
+// replicated to the cluster and the partition leaders have started.
+func (m *metadataAPI) CreateStream(ctx context.Context, req *proto.CreateStreamOp) *status.Status {
 	// Forward the request if we're not the leader.
 	if !m.IsLeader() {
-		return m.propagateCreateStream(ctx, req)
+		isLeader, st := m.propagateCreateStream(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
 	}
 
-	// Select replicationFactor nodes to participate in the stream.
-	replicas, st := m.getStreamReplicas(req.ReplicationFactor)
-	if st != nil {
-		return st
+	if len(req.Stream.Partitions) == 0 {
+		return status.New(codes.InvalidArgument, "no partitions provided")
 	}
 
-	// Select a leader at random.
-	leader := selectRandomReplica(replicas)
+	for _, partition := range req.Stream.Partitions {
+		// Select replicationFactor nodes to participate in the partition.
+		replicas, st := m.getPartitionReplicas(partition.ReplicationFactor)
+		if st != nil {
+			return st
+		}
+
+		// Select a leader at random.
+		leader := selectRandomReplica(replicas)
+
+		partition.Replicas = replicas
+		partition.Isr = replicas
+		partition.Leader = leader
+	}
 
 	// Replicate stream create through Raft.
 	op := &proto.RaftLog{
-		Op: proto.Op_CREATE_STREAM,
-		CreateStreamOp: &proto.CreateStreamOp{
-			Stream: &proto.Stream{
-				Subject:           req.Subject,
-				Name:              req.Name,
-				Group:             req.Group,
-				ReplicationFactor: req.ReplicationFactor,
-				Replicas:          replicas,
-				Leader:            leader,
-				Isr:               replicas,
-			},
-		},
+		Op:             proto.Op_CREATE_STREAM,
+		CreateStreamOp: req,
 	}
 
 	// Wait on result of replication.
-	future := m.applyRaftOperation(op)
-	if err := future.Error(); err != nil {
-		return status.New(codes.Internal, "Failed to replicate stream")
-	}
-
-	// If there is a response, it's an error (most likely ErrStreamExists).
-	if resp := future.Response(); resp != nil {
-		err := resp.(error)
-		code := codes.Internal
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkCreateStreamPreconditions)
+	if err != nil {
+		code := codes.FailedPrecondition
 		if err == ErrStreamExists {
 			code = codes.AlreadyExists
 		}
-		return status.New(code, err.Error())
+		return status.Newf(code, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to replicate partition: %v", err.Error())
 	}
 
-	// Wait for leader to create stream (best effort).
-	m.waitForStreamLeader(ctx, req.Subject, req.Name, leader)
+	// Wait for leaders to create partitions (best effort).
+	var wg sync.WaitGroup
+	wg.Add(len(req.Stream.Partitions))
+	for _, partition := range req.Stream.Partitions {
+		m.startGoroutineWithArgs(func(args ...interface{}) {
+			m.waitForPartitionLeader(ctx, args[0].(*proto.Partition))
+			wg.Done()
+		}, partition)
+	}
+	wg.Wait()
 
 	return nil
 }
 
-// ShrinkISR removes the specified replica from the stream's in-sync replicas
-// set if this server is the metadata leader. If it is not, it will forward the
-// request to the leader and return the response. This operation is replicated
-// by Raft.
+// DeleteStream deletes a stream if this server is the metadata leader. If it is
+// not, it will forward the request to the leader and return the response. This
+// operation is replicated by Raft. If successful, this will return once the
+// stream has been deleted from the cluster.
+func (m *metadataAPI) DeleteStream(ctx context.Context, req *proto.DeleteStreamOp) *status.Status {
+	// Forward the request if we're not the leader.
+	if !m.IsLeader() {
+		isLeader, st := m.propagateDeleteStream(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
+	}
+
+	// Replicate partition deletion through Raft.
+	op := &proto.RaftLog{
+		Op:             proto.Op_DELETE_STREAM,
+		DeleteStreamOp: req,
+	}
+
+	// Wait on result of deletion.
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkDeleteStreamPreconditions)
+	if err != nil {
+		code := codes.FailedPrecondition
+		if err == ErrStreamNotFound {
+			code = codes.NotFound
+		}
+		return status.Newf(code, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to delete stream: %v", err.Error())
+	}
+
+	return nil
+}
+
+// PauseStream pauses a stream if this server is the metadata leader. If it is
+// not, it will forward the request to the leader and return the response. This
+// operation is replicated by Raft. If successful, this will return once the
+// stream has been paused.
+func (m *metadataAPI) PauseStream(ctx context.Context, req *proto.PauseStreamOp) *status.Status {
+	// Forward the request if we're not the leader.
+	if !m.IsLeader() {
+		isLeader, st := m.propagatePauseStream(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
+	}
+
+	// Replicate stream pausing through Raft.
+	op := &proto.RaftLog{
+		Op:            proto.Op_PAUSE_STREAM,
+		PauseStreamOp: req,
+	}
+
+	// Wait on result of pausing.
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkPauseStreamPreconditions)
+	if err != nil {
+		code := codes.FailedPrecondition
+		if err == ErrStreamNotFound || err == ErrPartitionNotFound {
+			code = codes.NotFound
+		}
+		return status.Newf(code, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to pause stream: %v", err.Error())
+	}
+
+	return nil
+}
+
+// ResumeStream unpauses a stream partition(s) if this server is the metadata
+// leader. If it is not, it will forward the request to the leader and return
+// the response. This operation is replicated by Raft. Resume is intended to
+// be idempotent. If the partition is already resumed when this is called, this
+// will return nil. If the partition to resume is not specified on the request,
+// this will resume all paused partitions in the stream.
+func (m *metadataAPI) ResumeStream(ctx context.Context, req *proto.ResumeStreamOp) *status.Status {
+	// Forward the request if we're not the leader.
+	if !m.IsLeader() {
+		isLeader, st := m.propagateResumeStream(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
+	}
+
+	// Replicate stream resume through Raft.
+	op := &proto.RaftLog{
+		Op:             proto.Op_RESUME_STREAM,
+		ResumeStreamOp: req,
+	}
+
+	// Wait on result of replication.
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkResumeStreamPreconditions)
+	if err != nil {
+		code := codes.FailedPrecondition
+		if err == ErrStreamNotFound || err == ErrPartitionNotFound {
+			code = codes.NotFound
+		}
+		return status.Newf(code, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to resume stream: %v", err.Error())
+	}
+
+	// Wait for leader to resume partition(s) (best effort).
+	var wg sync.WaitGroup
+	wg.Add(len(req.Partitions))
+	for _, partitionID := range req.Partitions {
+		partition := m.GetPartition(req.Stream, partitionID)
+		m.startGoroutineWithArgs(func(args ...interface{}) {
+			m.waitForPartitionLeader(ctx, args[0].(*proto.Partition))
+			wg.Done()
+		}, partition.Partition)
+	}
+	wg.Wait()
+
+	return nil
+}
+
+// ShrinkISR removes the specified replica from the partition's in-sync
+// replicas set if this server is the metadata leader. If it is not, it will
+// forward the request to the leader and return the response. This operation is
+// replicated by Raft.
 func (m *metadataAPI) ShrinkISR(ctx context.Context, req *proto.ShrinkISROp) *status.Status {
 	// Forward the request if we're not the leader.
 	if !m.IsLeader() {
-		return m.propagateShrinkISR(ctx, req)
+		isLeader, st := m.propagateShrinkISR(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
 	}
 
-	// Verify the stream exists.
-	stream := m.GetStream(req.Subject, req.Name)
-	if stream == nil {
-		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such stream [subject=%s, name=%s]",
-			req.Subject, req.Name))
+	// Verify the partition exists.
+	partition := m.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such partition [stream=%s, partition=%d]",
+			req.Stream, req.Partition))
 	}
 
 	// Check the leader epoch.
-	leader, epoch := stream.GetLeader()
+	leader, epoch := partition.GetLeader()
 	if req.Leader != leader || req.LeaderEpoch != epoch {
 		return status.New(
 			codes.FailedPrecondition,
@@ -358,32 +519,43 @@ func (m *metadataAPI) ShrinkISR(ctx context.Context, req *proto.ShrinkISROp) *st
 	}
 
 	// Wait on result of replication.
-	if err := m.applyRaftOperation(op).Error(); err != nil {
-		return status.New(codes.Internal, "Failed to shrink ISR")
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkShrinkISRPreconditions)
+	if err != nil {
+		return status.Newf(codes.FailedPrecondition, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to shrink ISR: %v", err.Error())
 	}
 
 	return nil
 }
 
-// ExpandISR adds the specified replica to the stream's in-sync replicas set if
-// this server is the metadata leader. If it is not, it will forward the
+// ExpandISR adds the specified replica to the partition's in-sync replicas set
+// if this server is the metadata leader. If it is not, it will forward the
 // request to the leader and return the response. This operation is replicated
 // by Raft.
 func (m *metadataAPI) ExpandISR(ctx context.Context, req *proto.ExpandISROp) *status.Status {
 	// Forward the request if we're not the leader.
 	if !m.IsLeader() {
-		return m.propagateExpandISR(ctx, req)
+		isLeader, st := m.propagateExpandISR(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
 	}
 
-	// Verify the stream exists.
-	stream := m.GetStream(req.Subject, req.Name)
-	if stream == nil {
-		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such stream [subject=%s, name=%s]",
-			req.Subject, req.Name))
+	// Verify the partition exists.
+	partition := m.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such partition [stream=%s, partition=%d]",
+			req.Stream, req.Partition))
 	}
 
 	// Check the leader epoch.
-	leader, epoch := stream.GetLeader()
+	leader, epoch := partition.GetLeader()
 	if req.Leader != leader || req.LeaderEpoch != epoch {
 		return status.New(
 			codes.FailedPrecondition,
@@ -398,33 +570,44 @@ func (m *metadataAPI) ExpandISR(ctx context.Context, req *proto.ExpandISROp) *st
 	}
 
 	// Wait on result of replication.
-	if err := m.applyRaftOperation(op).Error(); err != nil {
-		return status.New(codes.Internal, "Failed to expand ISR")
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkExpandISRPreconditions)
+	if err != nil {
+		return status.Newf(codes.FailedPrecondition, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to expand ISR: %v", err.Error())
 	}
 
 	return nil
 }
 
-// ReportLeader marks the stream leader as unresponsive with respect to the
+// ReportLeader marks the partition leader as unresponsive with respect to the
 // specified replica if this server is the metadata leader. If it is not, it
 // will forward the request to the leader and return the response. If a quorum
-// of replicas report the stream leader within a bounded period, the metadata
-// leader will select a new stream leader.
+// of replicas report the partition leader within a bounded period, the
+// metadata leader will select a new partition leader.
 func (m *metadataAPI) ReportLeader(ctx context.Context, req *proto.ReportLeaderOp) *status.Status {
 	// Forward the request if we're not the leader.
 	if !m.IsLeader() {
-		return m.propagateReportLeader(ctx, req)
+		isLeader, st := m.propagateReportLeader(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
 	}
 
-	// Verify the stream exists.
-	stream := m.GetStream(req.Subject, req.Name)
-	if stream == nil {
-		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such stream [subject=%s, name=%s]",
-			req.Subject, req.Name))
+	// Verify the partition exists.
+	partition := m.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		return status.New(codes.FailedPrecondition, fmt.Sprintf("No such partition [stream=%s, partition=%d]",
+			req.Stream, req.Partition))
 	}
 
 	// Check the leader epoch.
-	leader, epoch := stream.GetLeader()
+	leader, epoch := partition.GetLeader()
 	if req.Leader != leader || req.LeaderEpoch != epoch {
 		return status.New(
 			codes.FailedPrecondition,
@@ -433,79 +616,138 @@ func (m *metadataAPI) ReportLeader(ctx context.Context, req *proto.ReportLeaderO
 	}
 
 	m.mu.Lock()
-	reported := m.leaderReports[stream]
+	reported := m.leaderReports[partition]
 	if reported == nil {
 		reported = &leaderReport{
-			stream:          stream,
+			partition:       partition,
 			witnessReplicas: make(map[string]struct{}),
 			api:             m,
 		}
-		m.leaderReports[stream] = reported
+		m.leaderReports[partition] = reported
 	}
 	m.mu.Unlock()
 
 	return reported.addWitness(req.Replica)
 }
 
-// AddStream adds the given stream to the metadata store. It returns
-// ErrStreamExists if there already exists a stream with the given subject and
-// name. If the stream is recovered, this will not start the stream until
-// recovery completes.
+// AddStream adds the given stream and its partitions to the metadata store. It
+// returns an error if a stream with the same name or any partitions with the
+// same ID for the stream already exist. If the stream is recovered, this will
+// not start the partitions until recovery completes. Partitions will also not
+// be started if they are currently paused.
 func (m *metadataAPI) AddStream(protoStream *proto.Stream, recovered bool) (*stream, error) {
+	if len(protoStream.Partitions) == 0 {
+		return nil, errors.New("stream has no partitions")
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	streams := m.streams[protoStream.Subject]
-	if streams == nil {
-		streams = make(subjectStreams)
-		m.streams[protoStream.Subject] = streams
-	}
-	if _, ok := streams[protoStream.Name]; ok {
-		// Stream for subject with name already exists.
+	_, ok := m.streams[protoStream.Name]
+	if ok {
 		return nil, ErrStreamExists
 	}
 
+	config := protoStream.GetConfig()
+	stream := newStream(protoStream.Name, protoStream.Subject, config)
+	m.streams[protoStream.Name] = stream
+
+	for _, partition := range protoStream.Partitions {
+		if err := m.addPartition(stream, partition, recovered, config); err != nil {
+			delete(m.streams, protoStream.Name)
+			return nil, err
+		}
+	}
+
+	return stream, nil
+}
+
+func (m *metadataAPI) addPartition(stream *stream, protoPartition *proto.Partition, recovered bool, config *proto.StreamConfig) error {
+	if p := stream.GetPartition(protoPartition.Id); p != nil {
+		// Partition already exists for stream.
+		return fmt.Errorf("partition %d already exists for stream %s",
+			protoPartition.Id, protoPartition.Stream)
+	}
+
 	// This will initialize/recover the durable commit log.
-	stream, err := m.newStream(protoStream, recovered)
+	partition, err := m.newPartition(protoPartition, recovered, config)
+	if err != nil {
+		return err
+	}
+	stream.SetPartition(protoPartition.Id, partition)
+
+	// If we're loading a partition that was paused, we need to re-pause it.
+	if protoPartition.Paused {
+		if err := partition.Pause(); err != nil {
+			return err
+		}
+	}
+
+	// Start leader/follower loop if necessary.
+	leader, epoch := partition.GetLeader()
+	return partition.SetLeader(leader, epoch)
+}
+
+// ResumePartition unpauses the given stream partition in the metadata store.
+// It returns ErrPartitionNotFound if there is no partition with the ID for the
+// stream. If the partition is recovered, this will not start the partition
+// until recovery completes.
+func (m *metadataAPI) ResumePartition(streamName string, id int32, recovered bool) (*partition, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stream, ok := m.streams[streamName]
+	if !ok {
+		return nil, ErrStreamNotFound
+	}
+	partition := stream.GetPartition(id)
+	if partition == nil {
+		return nil, ErrPartitionNotFound
+	}
+
+	// If it's not paused, do nothing.
+	if !partition.IsPaused() {
+		return partition, nil
+	}
+
+	// Resume the partition by replacing it.
+	partition, err := m.newPartition(partition.Partition, recovered, stream.GetConfig())
 	if err != nil {
 		return nil, err
 	}
-
-	streams[stream.Name] = stream
+	stream.SetPartition(id, partition)
 
 	// Start leader/follower loop if necessary.
-	leader, epoch := stream.GetLeader()
-	err = stream.SetLeader(leader, epoch)
-	return stream, err
+	leader, epoch := partition.GetLeader()
+	err = partition.SetLeader(leader, epoch)
+	return partition, err
 }
 
 // GetStreams returns all streams from the metadata store.
 func (m *metadataAPI) GetStreams() []*stream {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	ret := make([]*stream, 0, len(m.streams))
-	for _, streams := range m.streams {
-		for _, stream := range streams {
-			ret = append(ret, stream)
-		}
-	}
-	return ret
+	return m.getStreams()
 }
 
-// GetStream returns the stream with the given subject and name. It returns nil
-// if no such stream exists.
-func (m *metadataAPI) GetStream(subject, name string) *stream {
+// GetStream returns the stream with the given name or nil if no such stream
+// exists.
+func (m *metadataAPI) GetStream(name string) *stream {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	streams := m.streams[subject]
-	if streams == nil {
+	return m.streams[name]
+}
+
+// GetPartition returns the stream partition for the given stream and partition
+// ID. It returns nil if no such partition exists.
+func (m *metadataAPI) GetPartition(streamName string, id int32) *partition {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	stream, ok := m.streams[streamName]
+	if !ok {
 		return nil
 	}
-	stream := streams[name]
-	if stream == nil {
-		return nil
-	}
-	return stream
+	return stream.GetPartition(id)
 }
 
 // Reset closes all streams and clears all existing state in the metadata
@@ -513,18 +755,47 @@ func (m *metadataAPI) GetStream(subject, name string) *stream {
 func (m *metadataAPI) Reset() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, streams := range m.streams {
-		for _, stream := range streams {
-			if err := stream.Close(); err != nil {
-				return err
-			}
+	for _, stream := range m.getStreams() {
+		if err := stream.Close(); err != nil {
+			return err
 		}
 	}
-	m.streams = make(map[string]subjectStreams)
+	m.streams = make(map[string]*stream)
 	for _, report := range m.leaderReports {
 		report.cancel()
 	}
-	m.leaderReports = make(map[*stream]*leaderReport)
+	m.leaderReports = make(map[*partition]*leaderReport)
+	return nil
+}
+
+// CloseStream close a streams and clears corresponding state in the metadata
+// store.
+func (m *metadataAPI) CloseAndDeleteStream(stream *stream) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	err := stream.Delete()
+	if err != nil {
+		return errors.Wrap(err, "failed to delete stream")
+	}
+
+	// Remove the (now empty) stream data directory
+	streamDataDir := filepath.Join(m.Server.config.DataDir, "streams", stream.GetName())
+	err = os.Remove(streamDataDir)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete stream data directory")
+	}
+
+	delete(m.streams, stream.GetName())
+
+	for _, partition := range stream.GetPartitions() {
+		report, ok := m.leaderReports[partition]
+		if ok {
+			report.cancel()
+			delete(m.leaderReports, partition)
+		}
+	}
+
 	return nil
 }
 
@@ -535,12 +806,20 @@ func (m *metadataAPI) LostLeadership() {
 	for _, report := range m.leaderReports {
 		report.cancel()
 	}
-	m.leaderReports = make(map[*stream]*leaderReport)
+	m.leaderReports = make(map[*partition]*leaderReport)
 }
 
-// getStreamReplicas selects replicationFactor replicas to participate in the
-// stream.
-func (m *metadataAPI) getStreamReplicas(replicationFactor int32) ([]string, *status.Status) {
+func (m *metadataAPI) getStreams() []*stream {
+	streams := make([]*stream, 0, len(m.streams))
+	for _, stream := range m.streams {
+		streams = append(streams, stream)
+	}
+	return streams
+}
+
+// getPartitionReplicas selects replicationFactor replicas to participate in
+// the stream partition.
+func (m *metadataAPI) getPartitionReplicas(replicationFactor int32) ([]string, *status.Status) {
 	// TODO: Currently this selection is random but could be made more
 	// intelligent, e.g. selecting based on current load.
 	ids, err := m.getClusterServerIDs()
@@ -583,18 +862,18 @@ func (m *metadataAPI) getClusterServerIDs() ([]string, error) {
 	return ids, nil
 }
 
-// electNewStreamLeader selects a new leader for the given stream, applies this
-// update to the Raft group, and notifies the replica set. This will fail if
-// the current broker is not the metadata leader.
-func (m *metadataAPI) electNewStreamLeader(stream *stream) *status.Status {
-	isr := stream.GetISR()
+// electNewPartitionLeader selects a new leader for the given partition,
+// applies this update to the Raft group, and notifies the replica set. This
+// will fail if the current broker is not the metadata leader.
+func (m *metadataAPI) electNewPartitionLeader(partition *partition) *status.Status {
+	isr := partition.GetISR()
 	// TODO: add support for "unclean" leader elections.
 	if len(isr) <= 1 {
 		return status.New(codes.FailedPrecondition, "No ISR candidates")
 	}
 	var (
 		candidates = make([]string, 0, len(isr)-1)
-		leader, _  = stream.GetLeader()
+		leader, _  = partition.GetLeader()
 	)
 	for _, candidate := range isr {
 		if candidate == leader {
@@ -614,23 +893,28 @@ func (m *metadataAPI) electNewStreamLeader(stream *stream) *status.Status {
 	op := &proto.RaftLog{
 		Op: proto.Op_CHANGE_LEADER,
 		ChangeLeaderOp: &proto.ChangeLeaderOp{
-			Subject: stream.Subject,
-			Name:    stream.Name,
-			Leader:  leader,
+			Stream: partition.Stream,
+			Leader: leader,
 		},
 	}
 
 	// Wait on result of replication.
-	if err := m.applyRaftOperation(op).Error(); err != nil {
-		return status.New(codes.Internal, "Failed to replicate leader change")
+	future, err := m.getRaft().applyOperation(context.TODO(), op, m.checkChangeLeaderPreconditions)
+	if err != nil {
+		return status.Newf(codes.FailedPrecondition, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to replicate leader change: %v", err.Error())
 	}
 
 	return nil
 }
 
-// propagateCreateStream forwards a CreateStream request to the metadata leader
-// and returns the response.
-func (m *metadataAPI) propagateCreateStream(ctx context.Context, req *client.CreateStreamRequest) *status.Status {
+// propagateCreateStream forwards a CreateStream request to the metadata
+// leader. The bool indicates if this server has since become leader and the
+// request should be performed locally. A Status is returned if the propagated
+// request failed.
+func (m *metadataAPI) propagateCreateStream(ctx context.Context, req *proto.CreateStreamOp) (bool, *status.Status) {
 	propagate := &proto.PropagatedRequest{
 		Op:             proto.Op_CREATE_STREAM,
 		CreateStreamOp: req,
@@ -638,9 +922,46 @@ func (m *metadataAPI) propagateCreateStream(ctx context.Context, req *client.Cre
 	return m.propagateRequest(ctx, propagate)
 }
 
-// propagateShrinkISR forwards a ShrinkISR request to the metadata leader and
-// returns the response.
-func (m *metadataAPI) propagateShrinkISR(ctx context.Context, req *proto.ShrinkISROp) *status.Status {
+// propagateDeleteStream forwards a DeleteStream request to the metadata
+// leader. The bool indicates if this server has since become leader and the
+// request should be performed locally. A Status is returned if the propagated
+// request failed.
+func (m *metadataAPI) propagateDeleteStream(ctx context.Context, req *proto.DeleteStreamOp) (bool, *status.Status) {
+	propagate := &proto.PropagatedRequest{
+		Op:             proto.Op_DELETE_STREAM,
+		DeleteStreamOp: req,
+	}
+	return m.propagateRequest(ctx, propagate)
+}
+
+// propagatePauseStream forwards a PauseStream request to the metadata
+// leader. The bool indicates if this server has since become leader and the
+// request should be performed locally. A Status is returned if the propagated
+// request failed.
+func (m *metadataAPI) propagatePauseStream(ctx context.Context, req *proto.PauseStreamOp) (bool, *status.Status) {
+	propagate := &proto.PropagatedRequest{
+		Op:            proto.Op_PAUSE_STREAM,
+		PauseStreamOp: req,
+	}
+	return m.propagateRequest(ctx, propagate)
+}
+
+// propagateResumeStream forwards a ResumeStream request to the metadata
+// leader. The bool indicates if this server has since become leader and the
+// request should be performed locally. A Status is returned if the propagated
+// request failed.
+func (m *metadataAPI) propagateResumeStream(ctx context.Context, req *proto.ResumeStreamOp) (bool, *status.Status) {
+	propagate := &proto.PropagatedRequest{
+		Op:             proto.Op_RESUME_STREAM,
+		ResumeStreamOp: req,
+	}
+	return m.propagateRequest(ctx, propagate)
+}
+
+// propagateShrinkISR forwards a ShrinkISR request to the metadata leader. The
+// bool indicates if this server has since become leader and the request should
+// be performed locally. A Status is returned if the propagated request failed.
+func (m *metadataAPI) propagateShrinkISR(ctx context.Context, req *proto.ShrinkISROp) (bool, *status.Status) {
 	propagate := &proto.PropagatedRequest{
 		Op:          proto.Op_SHRINK_ISR,
 		ShrinkISROp: req,
@@ -648,9 +969,10 @@ func (m *metadataAPI) propagateShrinkISR(ctx context.Context, req *proto.ShrinkI
 	return m.propagateRequest(ctx, propagate)
 }
 
-// propagateExpandISR forwards a ExpandISR request to the metadata leader and
-// returns the response.
-func (m *metadataAPI) propagateExpandISR(ctx context.Context, req *proto.ExpandISROp) *status.Status {
+// propagateExpandISR forwards a ExpandISR request to the metadata leader. The
+// bool indicates if this server has since become leader and the request should
+// be performed locally. A Status is returned if the propagated request failed.
+func (m *metadataAPI) propagateExpandISR(ctx context.Context, req *proto.ExpandISROp) (bool, *status.Status) {
 	propagate := &proto.PropagatedRequest{
 		Op:          proto.Op_EXPAND_ISR,
 		ExpandISROp: req,
@@ -658,9 +980,11 @@ func (m *metadataAPI) propagateExpandISR(ctx context.Context, req *proto.ExpandI
 	return m.propagateRequest(ctx, propagate)
 }
 
-// propagateReportLeader forwards a ReportLeader request to the metadata leader
-// and returns the response.
-func (m *metadataAPI) propagateReportLeader(ctx context.Context, req *proto.ReportLeaderOp) *status.Status {
+// propagateReportLeader forwards a ReportLeader request to the metadata
+// leader. The bool indicates if this server has since become leader and the
+// request should be performed locally. A Status is returned if the propagated
+// request failed.
+func (m *metadataAPI) propagateReportLeader(ctx context.Context, req *proto.ReportLeaderOp) (bool, *status.Status) {
 	propagate := &proto.PropagatedRequest{
 		Op:             proto.Op_REPORT_LEADER,
 		ReportLeaderOp: req,
@@ -668,101 +992,238 @@ func (m *metadataAPI) propagateReportLeader(ctx context.Context, req *proto.Repo
 	return m.propagateRequest(ctx, propagate)
 }
 
-// propagateRequest forwards a metadata request to the metadata leader and
-// returns the response.
-func (m *metadataAPI) propagateRequest(ctx context.Context, req *proto.PropagatedRequest) *status.Status {
-	// Fail fast if there is no known metadata leader currently.
-	if m.getRaft().Leader() == "" {
-		return status.New(codes.Internal, "No known metadata leader")
+// propagateRequest forwards a metadata request to the metadata leader. The
+// bool indicates if this server has since become leader and the request should
+// be performed locally. A Status is returned if the propagated request failed.
+func (m *metadataAPI) propagateRequest(ctx context.Context, req *proto.PropagatedRequest) (bool, *status.Status) {
+	// Check if there is currently a metadata leader.
+	isLeader, err := m.waitForMetadataLeader(ctx)
+	if err != nil {
+		return false, status.New(codes.Internal, err.Error())
+	}
+	// This server has since become metadata leader, so the request should be
+	// performed locally.
+	if isLeader {
+		return true, nil
 	}
 
-	data, err := req.Marshal()
+	data, err := proto.MarshalPropagatedRequest(req)
 	if err != nil {
 		panic(err)
 	}
 
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultPropagateTimeout)
-		defer cancel()
-	}
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
 
 	resp, err := m.nc.RequestWithContext(ctx, m.getPropagateInbox(), data)
 	if err != nil {
-		return status.New(codes.Internal, err.Error())
+		return false, status.New(codes.Internal, err.Error())
 	}
 
-	r := &proto.PropagatedResponse{}
-	if err := r.Unmarshal(resp.Data); err != nil {
+	r, err := proto.UnmarshalPropagatedResponse(resp.Data)
+	if err != nil {
 		m.logger.Errorf("metadata: Invalid response for propagated request: %v", err)
-		return status.New(codes.Internal, "invalid response")
+		return false, status.New(codes.Internal, "invalid response")
 	}
 	if r.Error != nil {
-		return status.New(codes.Code(r.Error.Code), r.Error.Msg)
+		return false, status.New(codes.Code(r.Error.Code), r.Error.Msg)
 	}
 
-	return nil
+	return false, nil
 }
 
-// waitForStreamLeader does a best-effort wait for the leader of the given
-// stream to create and start the stream.
-func (m *metadataAPI) waitForStreamLeader(ctx context.Context, subject, name, leader string) {
-	if leader == m.config.Clustering.ServerID {
-		// If we're the stream leader, there's no need to make a status
+// waitForMetadataLeader waits up to the deadline specified on the Context
+// until a metadata leader is established. If no leader is established in time,
+// an error is returned. The bool indicates if this server has become the
+// leader. False and a nil error indicates another server has become leader.
+func (m *metadataAPI) waitForMetadataLeader(ctx context.Context) (bool, error) {
+	for {
+		if leader := m.getRaft().Leader(); leader != "" {
+			if string(leader) == m.config.Clustering.ServerID {
+				return true, nil
+			}
+			break
+		}
+		// Wait up to deadline for a metadata leader to be established.
+		deadline, _ := ctx.Deadline()
+		if time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		return false, errors.New("no known metadata leader")
+	}
+	return false, nil
+}
+
+// waitForPartitionLeader does a best-effort wait for the leader of the given
+// partition to create and start the partition.
+func (m *metadataAPI) waitForPartitionLeader(ctx context.Context, partition *proto.Partition) {
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
+
+	if partition.Leader == m.config.Clustering.ServerID {
+		// If we're the partition leader, there's no need to make a status
 		// request. We can just apply a Raft barrier since the FSM is local.
-		if err := m.getRaft().Barrier(5 * time.Second).Error(); err != nil {
+		deadline, _ := ctx.Deadline()
+		if err := m.getRaft().Barrier(time.Until(deadline)).Error(); err != nil {
 			m.logger.Warnf("Failed to apply Raft barrier: %v", err)
 		}
 		return
 	}
 
-	req, err := (&proto.StreamStatusRequest{
-		Subject: subject,
-		Name:    name,
-	}).Marshal()
+	req, err := proto.MarshalPartitionStatusRequest(&proto.PartitionStatusRequest{
+		Stream:    partition.Stream,
+		Partition: partition.Id,
+	})
 	if err != nil {
 		panic(err)
 	}
-	inbox := fmt.Sprintf(streamStatusInboxTemplate, m.baseMetadataRaftSubject(), leader)
+
+	inbox := m.getPartitionStatusInbox(partition.Leader)
 	for i := 0; i < 5; i++ {
 		resp, err := m.ncRaft.RequestWithContext(ctx, inbox, req)
 		if err != nil {
 			m.logger.Warnf(
-				"Failed to get status for stream [subject=%s, name=%s] from leader %s: %v",
-				subject, name, leader, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+				"Failed to get status for partition %s from leader %s: %v",
+				partition, partition.Leader, err)
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
-		statusResp := &proto.StreamStatusResponse{}
-		if err := statusResp.Unmarshal(resp.Data); err != nil {
+		statusResp, err := proto.UnmarshalPartitionStatusResponse(resp.Data)
+		if err != nil {
 			m.logger.Warnf(
-				"Invalid status response for stream [subject=%s, name=%s] from leader %s: %v",
-				subject, name, leader, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+				"Invalid status response for partition %s from leader %s: %v",
+				partition, partition.Leader, err)
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 		if !statusResp.Exists || !statusResp.IsLeader {
-			// The leader hasn't finished creating the stream, so wait a bit
+			// The leader hasn't finished creating the partition, so wait a bit
 			// and retry.
-			time.Sleep(100 * time.Millisecond)
-			continue
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 		break
 	}
 }
 
-// applyRaftOperation proposes the given operation to the Raft cluster. This
-// should only be called when the server is metadata leader. However, if the
-// server has lost leadership, the returned future will yield an error.
-func (m *metadataAPI) applyRaftOperation(op *proto.RaftLog) raft.ApplyFuture {
-	data, err := op.Marshal()
-	if err != nil {
-		panic(err)
+// checkCreateStreamPreconditions checks if the stream to be created already
+// exists. If it does, it returns ErrStreamExists. Otherwise, it returns nil.
+func (m *metadataAPI) checkCreateStreamPreconditions(op *proto.RaftLog) error {
+	partitions := op.CreateStreamOp.Stream.Partitions
+	if stream := m.GetStream(partitions[0].Stream); stream != nil {
+		return ErrStreamExists
 	}
-	return m.getRaft().Apply(data, raftApplyTimeout)
+	return nil
+}
+
+// checkDeleteStreamPreconditions checks if the stream being deleted exists. If
+// it doesn't, it returns ErrStreamNotFound. Otherwise, it returns nil.
+func (m *metadataAPI) checkDeleteStreamPreconditions(op *proto.RaftLog) error {
+	if stream := m.GetStream(op.DeleteStreamOp.Stream); stream == nil {
+		return ErrStreamNotFound
+	}
+	return nil
+}
+
+// checkPauseStreamPreconditions checks if the stream and partitions being
+// paused exist. If the stream doesn't exist, it returns ErrStreamNotFound. If
+// one or more specified partitions don't exist, it returns
+// ErrPartitionNotFound. Otherwise, it returns nil.
+func (m *metadataAPI) checkPauseStreamPreconditions(op *proto.RaftLog) error {
+	stream := m.GetStream(op.PauseStreamOp.Stream)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+	for _, partitionID := range op.PauseStreamOp.Partitions {
+		if partition := stream.GetPartition(partitionID); partition == nil {
+			return ErrPartitionNotFound
+		}
+	}
+	return nil
+}
+
+// checkResumeStreamPreconditions checks if the stream and partitions to be
+// resumed exist. If the stream does not exist, it returns ErrStreamNotFound.
+// If any partitions do not exist, it returns ErrPartitionNotFound. Otherwise,
+// it returns nil.
+func (m *metadataAPI) checkResumeStreamPreconditions(op *proto.RaftLog) error {
+	stream := m.GetStream(op.ResumeStreamOp.Stream)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+	for _, id := range op.ResumeStreamOp.Partitions {
+		if partition := stream.GetPartition(id); partition == nil {
+			return ErrPartitionNotFound
+		}
+	}
+	return nil
+}
+
+// checkShrinkISRPreconditions checks if the partition whose ISR is being
+// shrunk exists. If the stream doesn't exist, it returns ErrStreamNotFound. If
+// the partition doesn't exist, it returns ErrPartitionNotFound. Otherwise, it
+// returns nil.
+func (m *metadataAPI) checkShrinkISRPreconditions(op *proto.RaftLog) error {
+	return m.partitionExists(op.ShrinkISROp.Stream, op.ShrinkISROp.Partition)
+}
+
+// checkExpandISRPreconditions checks if the partition whose ISR is being
+// expanded exists. If the stream doesn't exist, it returns ErrStreamNotFound.
+// If the partition doesn't exist, it returns ErrPartitionNotFound. Otherwise,
+// it returns nil.
+func (m *metadataAPI) checkExpandISRPreconditions(op *proto.RaftLog) error {
+	return m.partitionExists(op.ExpandISROp.Stream, op.ExpandISROp.Partition)
+}
+
+// checkChangeLeaderPreconditions checks if the partition whose leader is being
+// changed exists. If the stream doesn't exist, it returns ErrStreamNotFound.
+// If the partition doesn't exist, it returns ErrPartitionNotFound. Otherwise,
+// it returns nil.
+func (m *metadataAPI) checkChangeLeaderPreconditions(op *proto.RaftLog) error {
+	return m.partitionExists(op.ChangeLeaderOp.Stream, op.ChangeLeaderOp.Partition)
+}
+
+// partitionExists indicates if the given partition exists in the stream. If
+// the stream doesn't exist, it returns ErrStreamNotFound. If the partition
+// doesn't exist, it returns ErrPartitionNotFound.
+func (m *metadataAPI) partitionExists(streamName string, partitionID int32) error {
+	stream := m.GetStream(streamName)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+	if partition := stream.GetPartition(partitionID); partition == nil {
+		return ErrPartitionNotFound
+	}
+	return nil
 }
 
 // selectRandomReplica selects a random replica from the list of replicas.
 func selectRandomReplica(replicas []string) string {
 	return replicas[rand.Intn(len(replicas))]
+}
+
+// ensureTimeout ensures there is a timeout on the Context. If there is, it
+// returns the Context. If there isn't it returns a new Context wrapping the
+// provided one with the default timeout applied. It also returns a cancel
+// function which must be invoked by the caller in all cases to avoid a Context
+// leak.
+func ensureTimeout(ctx context.Context, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+	}
+	return ctx, cancel
 }

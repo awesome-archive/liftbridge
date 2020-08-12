@@ -1,4 +1,4 @@
-//go:generate protoc -I=. -I=$GOPATH/src --gofast_out=. ./server/proto/internal.proto
+//go:generate protoc -I=. -I=$GOPATH/src --gofast_out=. ./server/protocol/internal.proto
 
 package main
 
@@ -14,72 +14,82 @@ import (
 	"github.com/liftbridge-io/liftbridge/server"
 )
 
-const version = "0.0.1"
-
 func main() {
 	app := cli.NewApp()
 	app.Name = "liftbridge"
 	app.Usage = "Lightweight, fault-tolerant message streams"
-	app.Version = version
+	app.Version = server.Version
 	app.Flags = getFlags()
-	app.Action = func(c *cli.Context) error {
-		// Read config from file if present.
-		config, err := server.NewConfig(c.String("config"))
-		if err != nil {
-			return err
-		}
-
-		// Override with flags.
-		if c.IsSet("id") {
-			config.Clustering.ServerID = c.String("id")
-		}
-		if c.IsSet("namespace") {
-			config.Clustering.Namespace = c.String("namespace")
-		}
-		if c.IsSet("port") {
-			config.Port = c.Int("port")
-		}
-		if c.IsSet("level") {
-			level, err := server.GetLogLevel(c.String("level"))
-			if err != nil {
-				return err
-			}
-			config.LogLevel = level
-		}
-		if c.IsSet("raft-bootstrap-seed") {
-			config.Clustering.RaftBootstrapSeed = c.Bool("raft-bootstrap-seed")
-		}
-		if c.IsSet("raft-bootstrap-peers") {
-			config.Clustering.RaftBootstrapPeers = c.StringSlice("raft-bootstrap-peers")
-		}
-		if c.IsSet("data-dir") {
-			config.DataDir = c.String("data-dir")
-		}
-		if c.IsSet("tls-cert") {
-			config.TLSCert = c.String("tls-cert")
-		}
-		if c.IsSet("tls-key") {
-			config.TLSKey = c.String("tls-key")
-		}
-		if c.IsSet("nats-servers") {
-			natsServers, err := normalizeNatsServers(c.StringSlice("nats-servers"))
-			if err != nil {
-				return err
-			}
-			config.NATS.Servers = natsServers
-		}
-
-		server := server.New(config)
-		if err := server.Start(); err != nil {
-			return err
-		}
-		runtime.Goexit()
-		return nil
-	}
-
+	app.Action = start
 	if err := app.Run(os.Args); err != nil {
 		panic(err)
 	}
+}
+
+func start(c *cli.Context) error {
+	// Read config from file if present.
+	config, err := server.NewConfig(c.String("config"))
+	if err != nil {
+		return err
+	}
+	if err := overrideFromFlags(c, config); err != nil {
+		return err
+	}
+	server := server.New(config)
+	if err := server.Start(); err != nil {
+		return err
+	}
+	runtime.Goexit()
+	return nil
+}
+
+func overrideFromFlags(c *cli.Context, config *server.Config) error {
+	// Override with flags.
+	if c.IsSet("id") {
+		config.Clustering.ServerID = c.String("id")
+	}
+	if c.IsSet("namespace") {
+		config.Clustering.Namespace = c.String("namespace")
+	}
+	if c.IsSet("port") {
+		config.Port = c.Int("port")
+	}
+	if c.IsSet("level") {
+		level, err := server.GetLogLevel(c.String("level"))
+		if err != nil {
+			return err
+		}
+		config.LogLevel = level
+	}
+	if c.IsSet("raft-bootstrap-seed") {
+		config.Clustering.RaftBootstrapSeed = c.Bool("raft-bootstrap-seed")
+	}
+	if c.IsSet("raft-bootstrap-peers") {
+		config.Clustering.RaftBootstrapPeers = c.StringSlice("raft-bootstrap-peers")
+	}
+	if c.IsSet("data-dir") {
+		config.DataDir = c.String("data-dir")
+	}
+	if c.IsSet("tls-cert") {
+		config.TLSCert = c.String("tls-cert")
+	}
+	if c.IsSet("tls-key") {
+		config.TLSKey = c.String("tls-key")
+	}
+	if c.IsSet("tls-client-auth") {
+		config.TLSClientAuth = c.Bool("tls-client-auth")
+	}
+	if c.IsSet("tls-client-auth-ca") {
+		config.TLSClientAuthCA = c.String("tls-client-auth-ca")
+	}
+	if c.IsSet("nats-servers") {
+		natsServers, err := normalizeNatsServers(c.StringSlice("nats-servers"))
+		if err != nil {
+			return err
+		}
+		config.NATS.Servers = natsServers
+	}
+	return nil
 }
 
 func getFlags() []cli.Flag {
